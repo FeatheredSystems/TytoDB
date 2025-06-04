@@ -1,23 +1,23 @@
 
 use std::{collections::{BTreeSet, HashMap}, ffi::CString, io::{self, Error, ErrorKind, Write}, os::unix::fs::FileExt, sync::Arc};
 use ahash::AHashMap;
-use tokio::{io::AsyncReadExt, sync::RwLock};
+use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio::fs::{File,self};
 use xxhash_rust::const_xxh3;
 use crate::{alba_types::AlbaTypes, database::{write_data, STRIX}, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo, strix::DataReference};
 
 
-type MvccType = Arc<RwLock<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
+type MvccType = Arc<Mutex<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
 #[derive(Debug)]
 pub struct Container{
-    pub file : Arc<RwLock<std::fs::File>>,
+    pub file : Arc<Mutex<std::fs::File>>,
     pub element_size : usize,
     pub headers : Vec<(String,AlbaTypes)>,
     pub str_size : usize,
     pub mvcc : MvccType,
     pub headers_offset : u64,
     pub location : String,
-    pub graveyard : Arc<RwLock<BTreeSet<u64>>>,
+    pub graveyard : Arc<Mutex<BTreeSet<u64>>>,
     pub indexing : Arc<Indexing>,
     file_path : String
 
@@ -44,7 +44,7 @@ fn serialize_closed_blob(item : &AlbaTypes,blob : &mut Vec<u8>,buffer : &mut Vec
 
 
 impl Container {
-    pub async fn new(container_name : String,path : &str,location : String,element_size : usize, columns : Vec<AlbaTypes>,str_size : usize,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<RwLock<Self>>,Error> {
+    pub async fn new(container_name : String,path : &str,location : String,element_size : usize, columns : Vec<AlbaTypes>,str_size : usize,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
         let mut  headers = Vec::new();
         for index in 0..((columns.len()+column_names.len())/2){
             let name = match column_names.get(index){
@@ -67,20 +67,20 @@ impl Container {
             }
             headers.push((name.to_owned(), value.to_owned()));
         }
-        let file = Arc::new(RwLock::new(std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap()));
+        let file = Arc::new(Mutex::new(std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap()));
         let mut hash_header = HashMap::new();
         for i in headers.iter(){
             hash_header.insert(i.0.clone(),i.1.clone());
         }
-        let container = Arc::new(RwLock::new(Container{
+        let container = Arc::new(Mutex::new(Container{
             file:file.clone(),
             element_size: element_size.clone(),
             str_size,
-            mvcc: Arc::new(RwLock::new((AHashMap::new(),HashMap::new()))),
+            mvcc: Arc::new(Mutex::new((AHashMap::new(),HashMap::new()))),
             headers_offset: headers_offset.clone() ,
             headers,
             location,
-            graveyard: Arc::new(RwLock::new(BTreeSet::new())),
+            graveyard: Arc::new(Mutex::new(BTreeSet::new())),
             indexing:Indexing::load_index(&container_name).await.unwrap(),
             file_path: path.to_string()
         }));
@@ -105,15 +105,14 @@ fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values:
     let bytes = &buf[*index..*index+instance_size];
     let mut size : [u8;8] = [0u8;8];
     size.clone_from_slice(&bytes[..8]); 
-    if bytes.len() < 8 {
-        return Err(gerr("Tamanho insuficiente para leitura do tamanho da string"));
+    if bytes.len() <= 8 {
+        return Err(gerr("Not insuficient string size"));
     }
     let string_length = usize::from_le_bytes(size);
     let string_bytes = if string_length > 0 {
-        let end = 8 + string_length;
-        let l = bytes.len()-8;
-        if end >= l {
-            &bytes[8..(l-8)]
+        let l = bytes.len();
+        if (string_length+8) >= l {
+            &bytes[8..]
         }else{
            &bytes[8..(8+string_length)] 
         }
@@ -122,11 +121,11 @@ fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values:
         
         let s = String::new();
         match instance_size {
-            10 => values.push(AlbaTypes::NanoString(s)),
-            100 => values.push(AlbaTypes::SmallString(s)),
-            500 => values.push(AlbaTypes::MediumString(s)),
-            2_000 => values.push(AlbaTypes::BigString(s)),
-            3_000 => values.push(AlbaTypes::LargeString(s)),
+            18 => values.push(AlbaTypes::NanoString(s)),
+            108 => values.push(AlbaTypes::SmallString(s)),
+            508 => values.push(AlbaTypes::MediumString(s)),
+            2_008 => values.push(AlbaTypes::BigString(s)),
+            3_008 => values.push(AlbaTypes::LargeString(s)),
             _ => unreachable!(),
         }
         return Ok(())
@@ -137,15 +136,14 @@ fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values:
         .take_while(|&&b| b != 0)
         .cloned()
         .collect();
-    let s = String::from_utf8(trimmed)
-        .map_err(|e| gerr(&format!("String decoding failed: {}", e)))?;
+    let s = String::from_utf8_lossy(&trimmed).to_string();
     
     match instance_size {
-        10 => values.push(AlbaTypes::NanoString(s)),
-        100 => values.push(AlbaTypes::SmallString(s)),
-        500 => values.push(AlbaTypes::MediumString(s)),
-        2_000 => values.push(AlbaTypes::BigString(s)),
-        3_000 => values.push(AlbaTypes::LargeString(s)),
+        18 => values.push(AlbaTypes::NanoString(s)),
+        108 => values.push(AlbaTypes::SmallString(s)),
+        508 => values.push(AlbaTypes::MediumString(s)),
+        2_008 => values.push(AlbaTypes::BigString(s)),
+        3_008 => values.push(AlbaTypes::LargeString(s)),
         _ => unreachable!(),
     }
     Ok(())
@@ -157,10 +155,8 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
     blob_size.clone_from_slice(&bytes[..8]); 
     let blob_length = usize::from_le_bytes(blob_size);
     let blob : Vec<u8> = if blob_length > 0 {
-        let end = 8 + blob_length;
-        let l = bytes.len();
-        if end > l {
-            bytes[8..(l-8)].to_vec()
+        if blob_length >= bytes.len() {
+            bytes[8..].to_vec()
         }else{
            bytes[8..(8+blob_length)].to_vec() 
         }
@@ -169,11 +165,11 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
         
         let blob = Vec::new();
         match size {
-            10 => values.push(AlbaTypes::NanoBytes(blob)),
-            1000 => values.push(AlbaTypes::SmallBytes(blob)),
-            10_000 => values.push(AlbaTypes::MediumBytes(blob)),
-            100_000 => values.push(AlbaTypes::BigSBytes(blob)),
-            1_000_000 => values.push(AlbaTypes::LargeBytes(blob)),
+            18 => values.push(AlbaTypes::NanoBytes(blob)),
+            1008 => values.push(AlbaTypes::SmallBytes(blob)),
+            10_008 => values.push(AlbaTypes::MediumBytes(blob)),
+            100_008 => values.push(AlbaTypes::BigSBytes(blob)),
+            1_000_008 => values.push(AlbaTypes::LargeBytes(blob)),
             _ => unreachable!(),
         }
         return Ok(())
@@ -182,11 +178,11 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
     *index += size;
     
     match size {
-        10 => values.push(AlbaTypes::NanoBytes(blob)),
-        1000 => values.push(AlbaTypes::SmallBytes(blob)),
-        10_000 => values.push(AlbaTypes::MediumBytes(blob)),
-        100_000 => values.push(AlbaTypes::BigSBytes(blob)),
-        1_000_000 => values.push(AlbaTypes::LargeBytes(blob)),
+        18 => values.push(AlbaTypes::NanoBytes(blob)),
+        1008 => values.push(AlbaTypes::SmallBytes(blob)),
+        10_008 => values.push(AlbaTypes::MediumBytes(blob)),
+        100_008 => values.push(AlbaTypes::BigSBytes(blob)),
+        1_000_008 => values.push(AlbaTypes::LargeBytes(blob)),
         _ => unreachable!(),
     }
     Ok(())
@@ -194,7 +190,7 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
 
 impl Container{
     pub async fn len(&self) -> Result<u64,Error>{
-        Ok(self.file.read().await.metadata()?.len())
+        Ok(self.file.lock().await.metadata()?.len())
     }
     pub async fn arrlen(&self) -> Result<u64, Error> {
         let file_len = self.len().await?;
@@ -204,10 +200,20 @@ impl Container{
             0
         };
         let mvcc_max = {
-            let mvcc = self.mvcc.read().await;
+            let mvcc = self.mvcc.lock().await;
             mvcc.0.keys().copied().max().map_or(0, |max_index| max_index + 1)
         };
         Ok(file_rows.max(mvcc_max))
+    }
+    pub async fn arrlen_abs(&self) -> Result<u64, Error> {
+        let file_len = self.len().await?;
+        let file_rows = if file_len > self.headers_offset {
+            (file_len - self.headers_offset) / self.element_size as u64
+        } else {
+            0
+        };
+        println!("header_offset: {:?}",self.headers_offset);
+        Ok(file_rows)
     }
     // pub fn get_alba_type_from_column_name(&self,column_name : &String) -> Option<AlbaTypes>{
     //     for i in self.headers.iter(){
@@ -220,14 +226,14 @@ impl Container{
     // }
 
     pub async fn get_next_addr(&self) -> Result<u64, Error> {
-        let mut graveyard = self.graveyard.write().await;
+        let mut graveyard = self.graveyard.lock().await;
         if graveyard.len() > 0{
             if let Some(id) = graveyard.pop_first(){
                 return Ok(id)
             }
         }
         let current_rows = self.arrlen().await?;
-        let mvcc = self.mvcc.read().await;
+        let mvcc = self.mvcc.lock().await;
         for (&key, (deleted, _)) in mvcc.0.iter() {
             if *deleted {
                 return Ok(key);
@@ -237,12 +243,12 @@ impl Container{
     } 
     pub async fn push_row(&mut self, data : &Vec<AlbaTypes>) -> Result<(),Error>{
         let ind = self.get_next_addr().await?;
-        let mut mvcc_guard = self.mvcc.write().await;
+        let mut mvcc_guard = self.mvcc.lock().await;
         mvcc_guard.0.insert(ind, (false,data.clone()));
         Ok(())
     }
     pub async fn rollback(&mut self) -> Result<(),Error> {
-        let mut mvcc_guard = self.mvcc.write().await;
+        let mut mvcc_guard = self.mvcc.lock().await;
         mvcc_guard.0.clear();
         mvcc_guard.1.clear();
         drop(mvcc_guard);
@@ -251,7 +257,7 @@ impl Container{
     pub async fn commit(&mut self) -> Result<(), Error> {
         let mut total = self.arrlen().await?;
         let mut virtual_ward : AHashMap<usize, DataReference> = AHashMap::new();
-        let mut mvcc = self.mvcc.write().await;
+        let mut mvcc = self.mvcc.lock().await;
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         for (index, value) in mvcc.0.iter() {
@@ -269,7 +275,7 @@ impl Container{
         let hdr_off = self.headers_offset;
         let row_sz = self.element_size as u64;
         let buf = vec![0u8; self.element_size];
-        let fi = self.file.write().await;
+        let mut fi = self.file.lock().await;
         for (row_index, row_data) in insertions {
             let serialized = self.serialize_row(&row_data)?;
             let offset = hdr_off + row_index * row_sz;
@@ -283,7 +289,7 @@ impl Container{
             virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
         }
         
-        let mut graveyard = self.graveyard.write().await;
+        let mut graveyard = self.graveyard.lock().await;
         for del in &deletes  {
             let from = hdr_off + del.0 * row_sz;
             if let Some(arg) = del.1.first(){
@@ -298,7 +304,6 @@ impl Container{
             total -= 1;
             graveyard.insert(del.0);
         }
-        drop(graveyard);
         let new_len = hdr_off + total * row_sz;
         fi.set_len(new_len)?;
         
@@ -328,25 +333,26 @@ impl Container{
 
         mvcc.1.clear();
         mvcc.1.shrink_to_fit();
-        if let Some(s) = STRIX.get(){
-            let mut l = s.write().await;
-            l.wards.push(RwLock::new((std::fs::OpenOptions::new().read(true).write(true).open(&self.file_path)?,virtual_ward)));
-        }
-        drop(mvcc);
+        // if let Some(s) = STRIX.get(){
+        //     let mut l = s.lock().await;
+        //     l.wards.push(Mutex::new((std::fs::OpenOptions::new().read(true).write(true).open(&self.file_path)?,virtual_ward)));
+        // }
+        fi.sync_data()?;
         Ok(())
     }
     pub async fn get_rows(&self, index: (u64, u64)) -> Result<Vec<Vec<AlbaTypes>>, Error> {
         // INDEXES WILL BE TREATED AS RELATIVE, EACH BEING A REFERENCE TO (X*ELEMENT_SIZE) + header_size
-        let arrlen = self.arrlen().await?;
+        let arrlen = self.arrlen_abs().await.unwrap();
         let max = index.1.min(arrlen);
         if index.0 > max{
             return Err(gerr(&format!("Failed to get rows, the first index should be lower than the second. Review the arguments: (index0:{},index1:{})",index.0,index.1)))
         }
-        let mut buffer = vec![0u8;(max-index.0).max(1) as usize * self.element_size];
-        self.file.read().await.read_exact_at(&mut buffer, (index.0 * self.element_size as u64)+self.headers_offset)?;
-        println!("{}//{}",buffer.len(),self.len().await?);
+
+        let mut buffer = vec![0u8;(max.abs_diff(index.0)).max(1) as usize * self.element_size];
+        self.file.lock().await.read_exact_at(&mut buffer, (index.0 * self.element_size as u64)+self.headers_offset).unwrap();
+        println!("{}//{}",buffer.len(),self.len().await.unwrap());
         
-        let mvcc = self.mvcc.read().await;
+        let mvcc = self.mvcc.lock().await;
         let mut result : Vec<Vec<AlbaTypes>> = Vec::with_capacity((max-index.0) as usize);
         for i in index.0..=max{
             let index = i as usize;
@@ -360,7 +366,7 @@ impl Container{
                 result.push(
                     self.deserialize_row(
                         &buffer[index*self.element_size .. (index+1)*self.element_size] // row-bytes
-                    ).await? // row
+                    ).await.unwrap() // row
                 );
             }
         }
@@ -382,7 +388,7 @@ impl Container{
         index.sort();
         let mut buffers : BTreeMap<u64,Vec<u8>> = BTreeMap::new();
         let mut result : Vec<Vec<AlbaTypes>> = Vec::new();
-        let mvcc = self.mvcc.read().await;
+        let mvcc = self.mvcc.lock().await;
         for i in index{
             if let Some(g) = mvcc.0.get(&i){
                 if !g.0{
@@ -592,18 +598,18 @@ impl Container{
                 },
     
                 // Fixed-size string types
-                AlbaTypes::NanoString(_) => handle_fixed_string(&buf, &mut index, 10, &mut values)?,
-                AlbaTypes::SmallString(_) => handle_fixed_string(&buf, &mut index, 100, &mut values)?,
-                AlbaTypes::MediumString(_) => handle_fixed_string(&buf, &mut index, 500, &mut values)?,
-                AlbaTypes::BigString(_) => handle_fixed_string(&buf, &mut index, 2000, &mut values)?,
-                AlbaTypes::LargeString(_) => handle_fixed_string(&buf, &mut index, 3000, &mut values)?,
+                AlbaTypes::NanoString(_) => handle_fixed_string(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::SmallString(_) => handle_fixed_string(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::MediumString(_) => handle_fixed_string(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::BigString(_) => handle_fixed_string(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::LargeString(_) => handle_fixed_string(&buf, &mut index, column_type.size(), &mut values)?,
     
                 // Byte array types
-                AlbaTypes::NanoBytes(_) => handle_bytes(&buf, &mut index, 10, &mut values)?,
-                AlbaTypes::SmallBytes(_) => handle_bytes(&buf, &mut index, 1000, &mut values)?,
-                AlbaTypes::MediumBytes(_) => handle_bytes(&buf, &mut index, 10_000, &mut values)?,
-                AlbaTypes::BigSBytes(_) => handle_bytes(&buf, &mut index, 100_000, &mut values)?,
-                AlbaTypes::LargeBytes(_) => handle_bytes(&buf, &mut index, 1_000_000, &mut values)?,
+                AlbaTypes::NanoBytes(_) => handle_bytes(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::SmallBytes(_) => handle_bytes(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::MediumBytes(_) => handle_bytes(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::BigSBytes(_) => handle_bytes(&buf, &mut index, column_type.size(), &mut values)?,
+                AlbaTypes::LargeBytes(_) => handle_bytes(&buf, &mut index, column_type.size(), &mut values)?,
     
                 // Null handling
                 AlbaTypes::NONE => {

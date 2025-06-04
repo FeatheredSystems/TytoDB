@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 use ahash::AHashMap;
 use base64::{alphabet, engine::{self, GeneralPurpose}, Engine};
 use lazy_static::lazy_static;
@@ -6,7 +6,7 @@ use serde::{Serialize,Deserialize};
 use serde_yaml;
 use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, parser::{debug_tokens, parse}, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, strix::{start_strix, Strix}, AlbaContainer, AST};
 use rand::{Rng, distributions::Alphanumeric};
-use tokio::{net::TcpListener, sync::{OnceCell,RwLock}};
+use tokio::{net::TcpListener, sync::{Mutex, OnceCell}, time::timeout};
 /////////////////////////////////////////////////
 /////////     DEFAULT_SETTINGS    ///////////////
 /////////////////////////////////////////////////
@@ -94,7 +94,7 @@ pub fn generate_secure_code(len: usize) -> String {
     code
 }
 
-pub const STRIX : OnceCell<Arc<RwLock<Strix>>> = OnceCell::const_new();
+pub const STRIX : OnceCell<Arc<Mutex<Strix>>> = OnceCell::const_new();
 
 #[derive(Default,Debug)]
 pub struct Database{
@@ -102,9 +102,9 @@ pub struct Database{
     settings : Settings,
     containers : Vec<String>,
     headers : Vec<(Vec<String>,Vec<AlbaTypes>)>,
-    pub container : HashMap<String,Arc<RwLock<Container>>>,
-    queries : Arc<RwLock<HashMap<String,Query>>>,
-    secret_keys : Arc<RwLock<HashMap<[u8;32],Vec<u8>>>>,
+    pub container : HashMap<String,Arc<Mutex<Container>>>,
+    queries : Arc<Mutex<HashMap<String,Query>>>,
+    secret_keys : Arc<Mutex<HashMap<[u8;32],Vec<u8>>>>,
 }
 
 fn check_for_reference_folder(location : &String) -> Result<(), Error>{
@@ -202,7 +202,7 @@ impl Database{
             
         }
         for (_, wedfygt) in self.container.iter() {
-            let wedfygt = wedfygt.read().await;
+            let wedfygt = wedfygt.lock().await;
             let count = (wedfygt.len().await? - wedfygt.headers_offset) / wedfygt.element_size as u64;
             
             if count < 1 {
@@ -213,7 +213,7 @@ impl Database{
                 
                 let mut wb = vec![0u8; wedfygt.element_size];
                 
-                if let Err(e) = wedfygt.file.read().await.read_exact_at(
+                if let Err(e) = wedfygt.file.lock().await.read_exact_at(
                     &mut wb,
                     wedfygt.headers_offset as u64 + (wedfygt.element_size as u64 * i as u64),
                 ) {
@@ -223,7 +223,7 @@ impl Database{
                 };
                 if wb == vec![0u8; wedfygt.element_size] {
                     
-                    wedfygt.graveyard.write().await.insert(i);
+                    wedfygt.graveyard.lock().await.insert(i);
                     
                 }
             }
@@ -249,7 +249,7 @@ impl Database{
         
         for (_, c) in self.container.iter_mut() {
             
-            c.write().await.commit().await?;
+            c.lock().await.commit().await?;
             
         }
         
@@ -260,7 +260,7 @@ impl Database{
         
         for (_, c) in self.container.iter_mut() {
             
-            c.write().await.rollback().await?;
+            c.lock().await.rollback().await?;
             
         }
         
@@ -446,7 +446,7 @@ impl Database{
                         
                         return Err(gerr(&format!("Container '{}' does not exist.", structure.container)));
                     },
-                    Some(a) => a.write().await,
+                    Some(a) => a.lock().await,
                 };
                 
                 if structure.col_nam.len() != structure.col_val.len() {
@@ -485,7 +485,7 @@ impl Database{
                                         
                                     }
                                     val[ri] = AlbaTypes::Text(code.clone());
-                                    let mut mvcc = container.mvcc.write().await;
+                                    let mut mvcc = container.mvcc.lock().await;
                                     
                                     mvcc.1.insert(code, (false, s.to_string()));
                                 } else {
@@ -551,7 +551,7 @@ impl Database{
                             Some(a) => a,
                             None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",container_name)))}
                         };
-                        let container_book = container.read().await;
+                        let container_book = container.lock().await;
                         let header_types = container_book.headers.clone();
 
                         loginfo!("search-row:p3");
@@ -559,20 +559,24 @@ impl Database{
                         for i in header_types.iter().cloned(){
                             headers_hash_map.insert(i.0,i.1);
                         }
-                        let qc = QueryConditions::from_primitive_conditions( structure.conditions.clone(), &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))})?;
-                        let qt = qc.query_type()?;
+                        let qc = QueryConditions::from_primitive_conditions( structure.conditions.clone(), &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))}).unwrap();
+                        let qt = qc.query_type().unwrap();
+                        let element_size = container_book.element_size.clone();
+                        let headers_offset = container_book.headers_offset.clone();
+                        let file = container_book.file.clone();
+                        let indexing = container_book.indexing.clone();
+                        drop(container_book);
                         let result = match qt{
                             QueryType::Scan => { 
-
                                 loginfo!("search-row:p3.1-");
-                                let r = search(container.clone(), SearchArguments{
-                                    element_size: container_book.element_size.clone(),
-                                    header_offset: container_book.headers_offset.clone() as usize,
-                                    file: container_book.file.clone(),
+                                let r = search(container.to_owned(), SearchArguments{
+                                    element_size,
+                                    header_offset: headers_offset as usize,
+                                    file,
                                     container_values: header_types,
                                     container_name,
                                     conditions: qc,
-                                }).await?;
+                                }).await.unwrap();
                                 loginfo!("search-row:p3.1");
                                 r
                             },
@@ -580,18 +584,18 @@ impl Database{
 
                                 loginfo!("search-row:p3.2-");
                                 let values = match query_index_type{
-                                    crate::query_conditions::QueryIndexType::Strict(t) => container_book.indexing.search(t).await,
-                                    crate::query_conditions::QueryIndexType::Range(t) => container_book.indexing.search(t).await,
-                                    crate::query_conditions::QueryIndexType::InclusiveRange(t) => container_book.indexing.search(t).await,
+                                    crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
+                                    crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
+                                    crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
                                 }?;
-                                let r = indexed_search(container.clone(), SearchArguments{
-                                    element_size: container_book.element_size.clone(),
-                                    header_offset: container_book.headers_offset.clone() as usize,
-                                    file: container_book.file.clone(),
+                                let r = indexed_search(container.to_owned(), SearchArguments{
+                                    element_size,
+                                    header_offset: headers_offset.clone() as usize,
+                                    file: file.clone(),
                                     container_values: header_types,
                                     container_name,
                                     conditions: qc,
-                                },&values).await?;
+                                },&values).await.unwrap();
 
                                 loginfo!("search-row:p3.2");
                                 r
@@ -616,19 +620,22 @@ impl Database{
                     Some(a) => a,
                     None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",structure.container)))}
                 };
-                let header_types = container.read().await.headers.clone();
+                let header_types = {
+                    let container_book = container.lock().await;
+                    container_book.headers.clone()
+                };
 
                 let mut headers_hash_map = HashMap::new();
                 for i in header_types.iter().cloned(){
                     headers_hash_map.insert(i.0,i.1);
                 }
-                let qc = QueryConditions::from_primitive_conditions( structure.conditions.clone(), &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))})?;
-                let container_book = container.read().await;
-                let qt = qc.query_type()?;
+                let qc = QueryConditions::from_primitive_conditions( structure.conditions.clone(), &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))}).unwrap();
+                let container_book = container.lock().await;
+                let qt = qc.query_type().unwrap();
 
                 let mut column_name_idx : AHashMap<String,usize> = AHashMap::new();
                 let mut changes : AHashMap<usize,AlbaTypes> = AHashMap::new();
-                for i in container.read().await.headers.iter().enumerate(){
+                for i in container.lock().await.headers.iter().enumerate(){
                     column_name_idx.insert(i.1.0.clone(), i.0);
                 }
                 for i in structure.col_nam.iter().enumerate(){
@@ -640,30 +647,34 @@ impl Database{
                     let id = column_name_idx.get(i.1).unwrap();
                     changes.insert(*id, val.to_owned());
                 }
-
+                let element_size = container_book.element_size.clone();
+                let headers_offset = container_book.headers_offset.clone();
+                let file = container_book.file.clone();
+                let indexing = container_book.indexing.clone();
+                drop(container_book);
                 let result : Vec<(Vec<AlbaTypes>,u64)> = match qt{
                     QueryType::Scan => { search_direct(container.clone(), SearchArguments{
-                        element_size: container_book.element_size.clone(),
-                        header_offset: container_book.headers_offset.clone() as usize,
-                        file: container_book.file.clone(),
+                        element_size,
+                        header_offset: headers_offset as usize,
+                        file,
                         container_values: header_types,
                         container_name: structure.container,
                         conditions: qc,
-                    }).await?}
+                    }).await.unwrap()}
                     QueryType::Indexed(query_index_type) => {
                         let values = match query_index_type{
-                            crate::query_conditions::QueryIndexType::Strict(t) => container_book.indexing.search(t).await,
-                            crate::query_conditions::QueryIndexType::Range(t) => container_book.indexing.search(t).await,
-                            crate::query_conditions::QueryIndexType::InclusiveRange(t) => container_book.indexing.search(t).await,
-                        }?;
+                            crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
+                            crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
+                            crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
+                        }.unwrap();
                         indexed_search_direct(container.clone(), SearchArguments{
-                            element_size: container_book.element_size.clone(),
-                            header_offset: container_book.headers_offset.clone() as usize,
-                            file: container_book.file.clone(),
+                            element_size,
+                            header_offset: headers_offset as usize,
+                            file,
                             container_values: header_types,
                             container_name: structure.container,
                             conditions: qc,
-                        },&values).await?
+                        },&values).await.unwrap()
                     }
                 }.iter_mut().map(|f|{
                     for i in &changes{
@@ -672,8 +683,8 @@ impl Database{
                     f.to_owned()
                 }).collect();
                 
-                let container = container.write().await;
-                let mut mvcc = container.mvcc.write().await;
+                let container = container.lock().await;
+                let mut mvcc = container.mvcc.lock().await;
                 for i in result{
                     mvcc.0.insert(i.1, (false,i.0));
                 }
@@ -684,7 +695,7 @@ impl Database{
                     Some(a) => a,
                     None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",structure.container)))}
                 };
-                let header_types = container.read().await.headers.clone();
+                let header_types = container.lock().await.headers.clone();
 
                 let mut headers_hash_map = HashMap::new();
                 for i in header_types.iter().cloned(){
@@ -692,7 +703,7 @@ impl Database{
                 }
                 loginfo!("del-row:p2");
                 let qc = QueryConditions::from_primitive_conditions( if let Some(c) = structure.conditions{c}else{(Vec::new(),Vec::new())}, &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))})?;
-                let container_book = container.read().await;
+                let container_book = container.lock().await;
                 let qt = qc.query_type()?;
                 loginfo!("del-row:p2.5");
 
@@ -735,7 +746,7 @@ impl Database{
                     }
                 };
                 loginfo!("del-row:p3");
-                let mut mvcc = container_book.mvcc.write().await;
+                let mut mvcc = container_book.mvcc.lock().await;
                 for i in result{
                     mvcc.0.insert(i.1, (true,i.0));
                 }
@@ -760,6 +771,10 @@ impl Database{
                     
                     let path = format!("{}/{}", self.location, structure.container);
                     tokio::fs::remove_file(path.clone()).await?;
+                    let path = format!("{}/{}.cindex", self.location, structure.container);
+                    tokio::fs::remove_file(path.clone()).await?;
+                    let path = format!("{}/{}.cimeta", self.location, structure.container);
+                    tokio::fs::remove_file(path.clone()).await?;
                     
                     self.save_containers()?;
                     
@@ -775,7 +790,7 @@ impl Database{
                         match self.container.get_mut(&container) {
                             Some(a) => {
                                 
-                                a.write().await.commit().await?;
+                                a.lock().await.commit().await?;
                                 
                                 return Ok(Query::new(Vec::new()));
                             },
@@ -799,7 +814,7 @@ impl Database{
                         match self.container.get_mut(&container) {
                             Some(a) => {
                                 
-                                a.write().await.rollback().await?;
+                                a.lock().await.rollback().await?;
                                 
                                 return Ok(Query::new(Vec::new()));
                             },
@@ -819,7 +834,7 @@ impl Database{
             AST::QueryControlNext(cmd) => {
                 
                 let mut q = {
-                    let mut guard = self.queries.write().await;
+                    let mut guard = self.queries.lock().await;
                     
                     guard.remove(&cmd.id).expect("query must exist")
                 };
@@ -827,13 +842,13 @@ impl Database{
                 q.next(self).await?;
                 let q1 = q.duplicate();
                 
-                self.queries.write().await.insert(cmd.id, q);
+                self.queries.lock().await.insert(cmd.id, q);
                 return Ok(q1);
             },
             AST::QueryControlPrevious(cmd) => {
                 
                 let mut q = {
-                    let mut guard = self.queries.write().await;
+                    let mut guard = self.queries.lock().await;
                     
                     guard.remove(&cmd.id).expect("query must exist")
                 };
@@ -841,12 +856,12 @@ impl Database{
                 q.previous(self).await?;
                 let q2 = q.duplicate();
                 
-                self.queries.write().await.insert(cmd.id, q);
+                self.queries.lock().await.insert(cmd.id, q);
                 return Ok(q2);
             },
             AST::QueryControlExit(cmd) => {
                 
-                let mut guard = self.queries.write().await;
+                let mut guard = self.queries.lock().await;
                 guard.remove(&cmd.id).expect("query must exist");
                 
             }
@@ -886,7 +901,7 @@ pub async fn connect() -> Result<Database, Error>{
         start_strix(strix.clone()).await;
     }
 
-    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new(),queries:Arc::new(RwLock::new(HashMap::new())),secret_keys:Arc::new(RwLock::new(HashMap::new()))};
+    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new(),queries:Arc::new(Mutex::new(HashMap::new())),secret_keys:Arc::new(Mutex::new(HashMap::new()))};
     db.setup().await?;
     if let Err(e) = db.load_settings(){
         logerr!("err: load_settings");
@@ -900,11 +915,11 @@ pub async fn connect() -> Result<Database, Error>{
 }
 
 
-async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<RwLock<Database>>) -> Vec<u8>{
+async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<Mutex<Database>>) -> Vec<u8>{
     let mut secret_key_hash : [u8;32] = [0u8;32];
     secret_key_hash.clone_from_slice(payload.as_slice());
 
-    let secret_key = match dbref.read().await.secret_keys.read().await.get(&secret_key_hash){
+    let secret_key = match dbref.lock().await.secret_keys.lock().await.get(&secret_key_hash){
         Some(a) => a.clone(),
         None => {
             let buffer : [u8;1] = [false as u8];
@@ -917,8 +932,8 @@ async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<RwLock<Databa
     let session_id = secret_key.clone();
     let hash = blake3::hash(&session_id).as_bytes().clone();
     let key = Key::<Aes256Gcm>::from_slice(secret_key.as_slice());
-    let _ = session_secret_rel.write().await.insert(hash.clone(), session_id.clone());
-    cipher_map.write().await.insert(hash.clone(),Aes256Gcm::new(key));
+    let _ = session_secret_rel.lock().await.insert(hash.clone(), session_id.clone());
+    cipher_map.lock().await.insert(hash.clone(),Aes256Gcm::new(key));
 
     if let Ok(a) = encrypt(&session_id, &secret_key_hash).await{
         buffer.push(true as u8);
@@ -934,7 +949,7 @@ async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<RwLock<Databa
 
 }
 
-// async fn handle_connections_tcp_sync(listener : &TcpListener,ardb : Arc<RwLock<Database>>){
+// async fn handle_connections_tcp_sync(listener : &TcpListener,ardb : Arc<Mutex<Database>>){
 //     let (mut socket, addr) = match listener.accept().await{
 //         Ok(a) => a,
 //         Err(e) => {
@@ -948,7 +963,7 @@ async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<RwLock<Databa
 //     //     logerr!("{}",e);
 //     // }
 // }
-// async fn handle_connections_tcp_parallel(listener : &TcpListener,ardb : Arc<RwLock<Database>>){
+// async fn handle_connections_tcp_parallel(listener : &TcpListener,ardb : Arc<Mutex<Database>>){
 //     let (mut socket, addr) = match listener.accept().await{
 //         Ok(a) => a,
 //         Err(e) => {
@@ -971,12 +986,12 @@ use aes_gcm::{aead::{Aead, KeyInit, OsRng}, aes::cipher::{self}, AeadCore, Key};
 use aes_gcm::Aes256Gcm;
 
 lazy_static!{
-    static ref cipher_map : Arc<RwLock<AHashMap<[u8;32],aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>>>>> = Arc::new(RwLock::new(AHashMap::new()));
-    static ref session_secret_rel : Arc<RwLock<AHashMap<[u8;32],Vec<u8>>>> = Arc::new(RwLock::new(AHashMap::new())); 
+    static ref cipher_map : Arc<Mutex<AHashMap<[u8;32],aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>>>>> = Arc::new(Mutex::new(AHashMap::new()));
+    static ref session_secret_rel : Arc<Mutex<AHashMap<[u8;32],Vec<u8>>>> = Arc::new(Mutex::new(AHashMap::new())); 
 }
 
 async fn encrypt(content : &[u8],secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
-    let cm = cipher_map.read().await;
+    let cm = cipher_map.lock().await;
     let cipher: &aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>> = 
     if let Some(a) = cm.get(secret_key){
         a
@@ -993,7 +1008,7 @@ async fn encrypt(content : &[u8],secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
 async fn decrypt(cipher_text : &[u8],secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
     let nonce = &cipher_text[0..12];
     let cipher_b = &cipher_text[12..];
-    let cm = cipher_map.read().await;
+    let cm = cipher_map.lock().await;
     let cipher: &aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>> = 
     if let Some(a) = cm.get(secret_key){
         a
@@ -1037,7 +1052,7 @@ impl TytoDBResponse {
 }
 
 
-async fn handle_data_tcp_inner(dbref: Arc<RwLock<Database>>,rc_payload:Vec<u8>) -> Vec<u8>{
+async fn handle_data_tcp_inner(dbref: Arc<Mutex<Database>>,rc_payload:Vec<u8>) -> Vec<u8>{
     let size = rc_payload.len();
     if size <= 0{
         logerr!("the payload is too short | size :{}",size);
@@ -1049,8 +1064,8 @@ async fn handle_data_tcp_inner(dbref: Arc<RwLock<Database>>,rc_payload:Vec<u8>) 
     //
 
 
-    let ssr = session_secret_rel.read().await;
-    let mut db = dbref.write().await;
+    let ssr = session_secret_rel.lock().await;
+    let mut db = dbref.lock().await;
     let mut payload: Vec<u8> = Vec::with_capacity(512);
     payload.extend_from_slice(&rc_payload[32..]);
     if let Some(_) = ssr.get(&session_id) {
@@ -1079,7 +1094,7 @@ async fn handle_data_tcp_inner(dbref: Arc<RwLock<Database>>,rc_payload:Vec<u8>) 
             match db.execute(&v.command,v.arguments).await {
                 Ok(query_result) => {
                     //
-                    db.queries.write().await.insert(query_result.id.clone(), query_result.clone());
+                    db.queries.lock().await.insert(query_result.id.clone(), query_result.clone());
                     //
                     match serde_json::to_string(&query_result) {
                         
@@ -1176,7 +1191,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 
-async fn handle_data(req: Request<hyper::body::Incoming>,dbref: Arc<RwLock<Database>>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_data(req: Request<hyper::body::Incoming>,dbref: Arc<Mutex<Database>>) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method().to_owned();
     let frame_stream = match req.collect().await{
         Ok(v)=> {v.to_bytes().to_vec()},
@@ -1223,7 +1238,7 @@ impl Database{
                 };
             }
 
-            let mut sk = self.secret_keys.write().await;
+            let mut sk = self.secret_keys.lock().await;
             for i in bv{
                 sk.insert(blake3::hash(&i).as_bytes().to_owned(), i);
             }
@@ -1233,7 +1248,7 @@ impl Database{
             for _ in 0..self.settings.secret_key_count{
                 keys.push(Aes256Gcm::generate_key(OsRng).to_vec());
             }
-            let mut sk = self.secret_keys.write().await;
+            let mut sk = self.secret_keys.lock().await;
             for i in keys.iter(){
                 sk.insert(blake3::hash(&i).as_bytes().to_owned(), i.clone());
             }
@@ -1255,7 +1270,7 @@ impl Database{
         //
         //
         
-        let mtx_db = Arc::new(RwLock::new(self));
+        let mtx_db = Arc::new(Mutex::new(self));
         // loop {
             
         //     handle_connections_tcp_sync(&connections_tcp,mtx_db.clone()).await;

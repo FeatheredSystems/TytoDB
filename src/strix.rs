@@ -2,7 +2,7 @@ use std::{fs::File, os::unix::fs::FileExt, sync::Arc};
 
 use ahash::AHashMap;
 use xxhash_rust::const_xxh3;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 type Checksum = u64;
 type BinaryData = Vec<u8>;
@@ -11,21 +11,21 @@ pub type Ward = (File,AHashMap<usize,DataReference>);
 
 #[derive(Default)]
 pub struct Strix{
-    pub wards : Vec<RwLock<Ward>>,
+    pub wards : Vec<Mutex<Ward>>,
 }
 
 
-pub async fn start_strix(strix : Arc<RwLock<Strix>>){
+pub async fn start_strix(strix : Arc<Mutex<Strix>>){
     //let interval = std::time::Duration::from_millis(100);
     tokio::task::spawn_blocking(async move ||{
         loop{
             // Sleeping
             //sleep(interval).await;
-            let fl = strix.read().await;
+            let fl = strix.lock().await;
             let wards_iter = fl.wards.iter().enumerate();
             let mut to_remove : Vec<usize> = Vec::new();
             for (_,i) in wards_iter{
-                let mut lock = i.write().await;
+                let mut lock = i.lock().await;
                 if lock.1.len() > 0{
                     for (k,i) in lock.1.iter(){
                         let mut comp = vec![0u8;i.1.len()];
@@ -46,7 +46,7 @@ pub async fn start_strix(strix : Arc<RwLock<Strix>>){
                 }
             }
             drop(fl);
-            let mut fl = strix.write().await;
+            let mut fl = strix.lock().await;
             for &idx in to_remove.iter().rev() {
                 fl.wards.remove(idx);
             }

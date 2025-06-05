@@ -2,7 +2,6 @@ mod lexer_functions;
 mod database;
 mod container;
 mod parser;
-mod strix;
 mod row;
 mod query;
 mod indexing;
@@ -150,18 +149,6 @@ struct AstCommit{
 #[derive(Debug, Clone, PartialEq)]
 struct AstRollback{
     container : Option<String>,
-}
-#[derive(Debug, Clone, PartialEq)]
-struct AstQueryControlNext{
-    id : String,
-}
-#[derive(Debug, Clone, PartialEq)]
-struct AstQueryControlPrevious{
-    id : String,
-}
-#[derive(Debug, Clone, PartialEq)]
-struct AstQueryControlExit{
-    id : String,
 }
 
 fn gerr(msg : &str) -> Error{

@@ -1,14 +1,9 @@
-use std::{collections::{BTreeSet, HashMap}, fs::File, io::Error, ops::Index, os::unix::fs::{FileExt, MetadataExt}, sync::Arc, vec};
-use blake3::Hash;
-use futures::SinkExt;
+use std::{collections::{BTreeSet, HashMap}, fs::File, io::Error, os::unix::fs::{FileExt, MetadataExt}, sync::Arc, vec};
 use tokio::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{alba_types::AlbaTypes, container::Container, database::{generate_secure_code, Database}, gerr, lexer_functions::Token, logerr, loginfo, query_conditions::QueryConditions, row::Row};
-
-
-const PAGE_SIZE: usize = 100;
+use crate::{alba_types::AlbaTypes, container::Container, database::generate_secure_code, gerr, lexer_functions::Token, logerr, loginfo, query_conditions::QueryConditions, row::Row};
 
 pub type PrimitiveQueryConditions = (Vec<(Token, Token, Token)>, Vec<(usize, char)>);
 
@@ -24,16 +19,6 @@ pub struct Query {
 }
 
 impl Query {
-    pub fn duplicate(&self) -> Self {
-        
-        Query {
-            rows: self.rows.clone(),
-            current_page: self.current_page, 
-            column_names: self.column_names.clone(),
-            column_types: self.column_types.clone(),
-            id: self.id.clone(),
-        }
-    }
 
     pub fn trim(&mut self) {
         
@@ -96,7 +81,6 @@ pub struct SearchArguments {
     pub header_offset : usize,
     pub file : Arc<Mutex<File>>,
     pub container_values : Vec<(String,AlbaTypes)>,
-    pub container_name : String,
     pub conditions : QueryConditions
 
 }

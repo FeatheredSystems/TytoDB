@@ -3,7 +3,7 @@ use std::{collections::{BTreeSet, HashMap}, ffi::CString, io::{self, Error, Erro
 use ahash::AHashMap;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio::fs::{File,self};
-use crate::{alba_types::AlbaTypes, database::write_data, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo, strix::DataReference};
+use crate::{alba_types::AlbaTypes, database::write_data, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo};
 
 
 type MvccType = Arc<Mutex<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
@@ -17,8 +17,7 @@ pub struct Container{
     pub headers_offset : u64,
     pub location : String,
     pub graveyard : Arc<Mutex<BTreeSet<u64>>>,
-    pub indexing : Arc<Indexing>,
-    file_path : String
+    pub indexing : Arc<Indexing>
 
 }
 fn serialize_closed_string(item : &AlbaTypes,s : &String,buffer : &mut Vec<u8>){
@@ -80,8 +79,7 @@ impl Container {
             headers,
             location,
             graveyard: Arc::new(Mutex::new(BTreeSet::new())),
-            indexing:Indexing::load_index(&container_name).await.unwrap(),
-            file_path: path.to_string()
+            indexing:Indexing::load_index(&container_name).await.unwrap()
         }));
         Ok(container)
     }
@@ -254,7 +252,6 @@ impl Container{
         Ok(())
     }
     pub async fn commit(&mut self) -> Result<(), Error> {
-        let mut total = self.arrlen().await?;
         //let mut virtual_ward : AHashMap<usize, DataReference> = AHashMap::new();
         let mut mvcc = self.mvcc.lock().await;
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
@@ -300,8 +297,6 @@ impl Container{
             }
             
             fi.write_all_at(&buf, from).unwrap();
-            //virtual_ward.insert(from as usize, (const_xxh3::xxh3_64(&buf),buf.clone()));
-            total -= 1;
             graveyard.insert(del.0);
         }
         
@@ -338,38 +333,38 @@ impl Container{
         fi.sync_all().unwrap();
         Ok(())
     }
-    pub async fn get_rows(&self, index: (u64, u64)) -> Result<Vec<Vec<AlbaTypes>>, Error> {
-        // INDEXES WILL BE TREATED AS RELATIVE, EACH BEING A REFERENCE TO (X*ELEMENT_SIZE) + header_size
-        let arrlen = self.arrlen_abs().await.unwrap();
-        let max = index.1.min(arrlen);
-        if index.0 > max{
-            return Err(gerr(&format!("Failed to get rows, the first index should be lower than the second. Review the arguments: (index0:{},index1:{})",index.0,index.1)))
-        }
+    // pub async fn get_rows(&self, index: (u64, u64)) -> Result<Vec<Vec<AlbaTypes>>, Error> {
+    //     // INDEXES WILL BE TREATED AS RELATIVE, EACH BEING A REFERENCE TO (X*ELEMENT_SIZE) + header_size
+    //     let arrlen = self.arrlen_abs().await.unwrap();
+    //     let max = index.1.min(arrlen);
+    //     if index.0 > max{
+    //         return Err(gerr(&format!("Failed to get rows, the first index should be lower than the second. Review the arguments: (index0:{},index1:{})",index.0,index.1)))
+    //     }
 
-        let mut buffer = vec![0u8;(max.abs_diff(index.0)).max(1) as usize * self.element_size];
-        self.file.lock().await.read_exact_at(&mut buffer, (index.0 * self.element_size as u64)+self.headers_offset).unwrap();
-        println!("{}//{}",buffer.len(),self.len().await.unwrap());
+    //     let mut buffer = vec![0u8;(max.abs_diff(index.0)).max(1) as usize * self.element_size];
+    //     self.file.lock().await.read_exact_at(&mut buffer, (index.0 * self.element_size as u64)+self.headers_offset).unwrap();
+    //     println!("{}//{}",buffer.len(),self.len().await.unwrap());
         
-        let mvcc = self.mvcc.lock().await;
-        let mut result : Vec<Vec<AlbaTypes>> = Vec::with_capacity((max-index.0) as usize);
-        for i in index.0..=max{
-            let index = i as usize;
-            if let Some(val) = mvcc.0.get(&i){
-                if !val.0{
-                    result.push(val.1.clone());
-                    continue;
-                }
-            }
-            if buffer.len() > self.element_size*index{
-                result.push(
-                    self.deserialize_row(
-                        &buffer[index*self.element_size .. (index+1)*self.element_size] // row-bytes
-                    ).await.unwrap() // row
-                );
-            }
-        }
-        Ok(result)
-    }
+    //     let mvcc = self.mvcc.lock().await;
+    //     let mut result : Vec<Vec<AlbaTypes>> = Vec::with_capacity((max-index.0) as usize);
+    //     for i in index.0..=max{
+    //         let index = i as usize;
+    //         if let Some(val) = mvcc.0.get(&i){
+    //             if !val.0{
+    //                 result.push(val.1.clone());
+    //                 continue;
+    //             }
+    //         }
+    //         if buffer.len() > self.element_size*index{
+    //             result.push(
+    //                 self.deserialize_row(
+    //                     &buffer[index*self.element_size .. (index+1)*self.element_size] // row-bytes
+    //                 ).await.unwrap() // row
+    //             );
+    //         }
+    //     }
+    //     Ok(result)
+    // }
     
     /* 
     pub async fn get_spread_rows(&mut self, index: &mut Vec<u64>) -> Result<Vec<Vec<AlbaTypes>>, Error> {

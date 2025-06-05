@@ -1,12 +1,12 @@
-use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, str::FromStr, sync::Arc};
 use ahash::AHashMap;
 use base64::{alphabet, engine::{self, GeneralPurpose}, Engine};
 use lazy_static::lazy_static;
 use serde::{Serialize,Deserialize};
 use serde_yaml;
-use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, parser::{debug_tokens, parse}, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, strix::{start_strix, Strix}, AlbaContainer, AST};
+use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, parser::{debug_tokens, parse}, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, AlbaContainer, AST};
 use rand::{Rng, distributions::Alphanumeric};
-use tokio::{net::TcpListener, sync::{Mutex, OnceCell}, time::timeout};
+use tokio::{net::TcpListener, sync::Mutex};
 /////////////////////////////////////////////////
 /////////     DEFAULT_SETTINGS    ///////////////
 /////////////////////////////////////////////////
@@ -94,8 +94,6 @@ pub fn generate_secure_code(len: usize) -> String {
     code
 }
 
-pub const STRIX : OnceCell<Arc<Mutex<Strix>>> = OnceCell::const_new();
-
 #[derive(Default,Debug)]
 pub struct Database{
     location : String,
@@ -103,7 +101,6 @@ pub struct Database{
     containers : Vec<String>,
     headers : Vec<(Vec<String>,Vec<AlbaTypes>)>,
     pub container : HashMap<String,Arc<Mutex<Container>>>,
-    queries : Arc<Mutex<HashMap<String,Query>>>,
     secret_keys : Arc<Mutex<HashMap<[u8;32],Vec<u8>>>>,
 }
 
@@ -574,7 +571,6 @@ impl Database{
                                     header_offset: headers_offset as usize,
                                     file,
                                     container_values: header_types,
-                                    container_name,
                                     conditions: qc,
                                 }).await.unwrap();
                                 loginfo!("search-row:p3.1");
@@ -593,7 +589,6 @@ impl Database{
                                     header_offset: headers_offset as usize,
                                     file,
                                     container_values: header_types,
-                                    container_name,
                                     conditions: qc,
                                 },&values).await.unwrap();
 
@@ -696,7 +691,6 @@ impl Database{
                                 header_offset: headers_offset as usize,
                                 file,
                                 container_values: header_types,
-                                container_name: structure.container,
                                 conditions: qc,
                             }).await.unwrap()
                         }
@@ -722,7 +716,6 @@ impl Database{
                                 header_offset: headers_offset as usize,
                                 file,
                                 container_values: header_types,
-                                container_name: structure.container,
                                 conditions: qc,
                             }, &values).await.unwrap()
                         }
@@ -784,7 +777,6 @@ impl Database{
                             header_offset: headers_offset as usize,
                             file,
                             container_values: header_types,
-                            container_name: structure.container,
                             conditions: qc,
                         }).await?;
                         
@@ -806,7 +798,6 @@ impl Database{
                             header_offset: headers_offset as usize,
                             file,
                             container_values: header_types,
-                            container_name: structure.container,
                             conditions: qc,
                         },&values).await?;
 
@@ -937,7 +928,7 @@ pub async fn connect() -> Result<Database, Error>{
     //     start_strix(strix.clone()).await;
     // }
 
-    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new(),queries:Arc::new(Mutex::new(HashMap::new())),secret_keys:Arc::new(Mutex::new(HashMap::new()))};
+    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new(),secret_keys:Arc::new(Mutex::new(HashMap::new()))};
     db.setup().await?;
     if let Err(e) = db.load_settings(){
         logerr!("err: load_settings");

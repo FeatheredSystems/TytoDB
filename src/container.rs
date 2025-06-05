@@ -1,10 +1,9 @@
 
-use std::{collections::{BTreeSet, HashMap}, ffi::CString, io::{self, Error, ErrorKind, Write}, os::unix::fs::FileExt, sync::Arc};
+use std::{collections::{BTreeSet, HashMap}, ffi::CString, io::{self, Error, ErrorKind, Write}, mem::discriminant, os::unix::fs::FileExt, sync::Arc};
 use ahash::AHashMap;
 use tokio::{io::AsyncReadExt, sync::Mutex};
 use tokio::fs::{File,self};
-use xxhash_rust::const_xxh3;
-use crate::{alba_types::AlbaTypes, database::{write_data, STRIX}, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo, strix::DataReference};
+use crate::{alba_types::AlbaTypes, database::write_data, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo, strix::DataReference};
 
 
 type MvccType = Arc<Mutex<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
@@ -256,7 +255,7 @@ impl Container{
     }
     pub async fn commit(&mut self) -> Result<(), Error> {
         let mut total = self.arrlen().await?;
-        let mut virtual_ward : AHashMap<usize, DataReference> = AHashMap::new();
+        //let mut virtual_ward : AHashMap<usize, DataReference> = AHashMap::new();
         let mut mvcc = self.mvcc.lock().await;
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
@@ -275,7 +274,7 @@ impl Container{
         let hdr_off = self.headers_offset;
         let row_sz = self.element_size as u64;
         let buf = vec![0u8; self.element_size];
-        let mut fi = self.file.lock().await;
+        let fi = self.file.lock().await;
         for (row_index, row_data) in insertions {
             let serialized = self.serialize_row(&row_data)?;
             let offset = hdr_off + row_index * row_sz;
@@ -286,26 +285,25 @@ impl Container{
                 i.add(idx, j).await?;
             }
             fi.write_all_at(serialized.as_slice(), offset)?;
-            virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
+            //virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
         }
         
         let mut graveyard = self.graveyard.lock().await;
         for del in &deletes  {
-            let from = hdr_off + del.0 * row_sz;
+            loginfo!("{}",del.0/row_sz);
+            let from = hdr_off + del.0;
             if let Some(arg) = del.1.first(){
                 let i = self.indexing.clone();
                 let j = from.clone();
                 let idx = arg.get_index();
-                i.remove(idx, j).await?;
+                i.remove(idx, j).await.unwrap();
             }
             
-            fi.write_all_at(&buf, from)?;
-            virtual_ward.insert(from as usize, (const_xxh3::xxh3_64(&buf),buf.clone()));
+            fi.write_all_at(&buf, from).unwrap();
+            //virtual_ward.insert(from as usize, (const_xxh3::xxh3_64(&buf),buf.clone()));
             total -= 1;
             graveyard.insert(del.0);
         }
-        let new_len = hdr_off + total * row_sz;
-        fi.set_len(new_len)?;
         
 
         for (i, txt) in  mvcc.1.iter(){
@@ -337,7 +335,7 @@ impl Container{
         //     let mut l = s.lock().await;
         //     l.wards.push(Mutex::new((std::fs::OpenOptions::new().read(true).write(true).open(&self.file_path)?,virtual_ward)));
         // }
-        fi.sync_data()?;
+        fi.sync_all().unwrap();
         Ok(())
     }
     pub async fn get_rows(&self, index: (u64, u64)) -> Result<Vec<Vec<AlbaTypes>>, Error> {
@@ -437,6 +435,8 @@ impl Container{
         let mut buffer = Vec::with_capacity(self.element_size);
     
         for (item, ty) in row.iter().zip(self.columns().iter()) {
+            loginfo!("item: {:?} | ty: {:?}",discriminant(item),discriminant(ty));
+            let item = &AlbaTypes::to_another(item, ty);
             match (item, ty) {
                 (AlbaTypes::Bigint(v), AlbaTypes::Bigint(_)) => {
                     buffer.extend_from_slice(&v.to_be_bytes());

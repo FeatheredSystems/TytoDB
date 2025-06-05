@@ -1,11 +1,11 @@
-use std::io::{Error, ErrorKind};
+use std::{fmt, io::{Error, ErrorKind}};
 
 use base64::{engine::general_purpose, Engine};
 use serde::{Deserialize, Serialize};
 
 use crate::{database::MAX_STR_LEN, lexer_functions::Token};
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive( Clone, PartialEq, Deserialize, Serialize)]
 pub enum AlbaTypes{
     Text(String),
     Int(i32),
@@ -25,6 +25,46 @@ pub enum AlbaTypes{
     LargeBytes(Vec<u8>),
     NONE
 }
+fn format_bytes_debug(
+    f: &mut fmt::Formatter<'_>,
+    variant_name: &str,
+    bytes: &Vec<u8>,
+    limit: usize,
+) -> fmt::Result {
+    write!(f, "{}(", variant_name)?;
+    let mut list = f.debug_list();
+    list.entries(bytes.iter().take(limit));
+    if bytes.len() > limit {
+        list.entry(&format_args!("... ({} more bytes)", bytes.len() - limit));
+    }
+    list.finish()?;
+    write!(f, ")")
+}
+
+impl fmt::Debug for AlbaTypes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlbaTypes::Text(s) => f.debug_tuple("Text").field(s).finish(),
+            AlbaTypes::Int(i) => f.debug_tuple("Int").field(i).finish(),
+            AlbaTypes::Bigint(i) => f.debug_tuple("Bigint").field(i).finish(),
+            AlbaTypes::Float(fl) => f.debug_tuple("Float").field(fl).finish(),
+            AlbaTypes::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            AlbaTypes::Char(c) => f.debug_tuple("Char").field(c).finish(),
+            AlbaTypes::NanoString(s) => f.debug_tuple("NanoString").field(s).finish(),
+            AlbaTypes::SmallString(s) => f.debug_tuple("SmallString").field(s).finish(),
+            AlbaTypes::MediumString(s) => f.debug_tuple("MediumString").field(s).finish(),
+            AlbaTypes::BigString(s) => f.debug_tuple("BigString").field(s).finish(),
+            AlbaTypes::LargeString(s) => f.debug_tuple("LargeString").field(s).finish(),
+            AlbaTypes::NanoBytes(bytes) => format_bytes_debug(f, "NanoBytes", bytes, 10),
+            AlbaTypes::SmallBytes(bytes) => format_bytes_debug(f, "SmallBytes", bytes, 10),
+            AlbaTypes::MediumBytes(bytes) => format_bytes_debug(f, "MediumBytes", bytes, 10),
+            AlbaTypes::BigSBytes(bytes) => format_bytes_debug(f, "BigSBytes", bytes, 10),
+            AlbaTypes::LargeBytes(bytes) => format_bytes_debug(f, "LargeBytes", bytes, 10),
+            AlbaTypes::NONE => write!(f, "NONE"),
+        }
+    }
+}
+
 /*
 char ~ 1
 string~n ~ 10
@@ -40,6 +80,61 @@ bytes-l ~ 1,000,000
 
 */
 
+impl AlbaTypes {
+    pub fn to_another(x: &AlbaTypes, y: &AlbaTypes) -> AlbaTypes {
+        match y {
+            AlbaTypes::Text(_) => AlbaTypes::Text(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::Int(_) => AlbaTypes::Int(0)
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::Bigint(_) => AlbaTypes::Bigint(0)
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::Float(_) => AlbaTypes::Float(0.0)
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::Bool(_) => AlbaTypes::Bool(false)
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::Char(_) => AlbaTypes::Char('\0')
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::NanoString(_) => AlbaTypes::NanoString(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::SmallString(_) => AlbaTypes::SmallString(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::MediumString(_) => AlbaTypes::MediumString(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::BigString(_) => AlbaTypes::BigString(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::LargeString(_) => AlbaTypes::LargeString(String::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::NanoBytes(_) => AlbaTypes::NanoBytes(Vec::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::SmallBytes(_) => AlbaTypes::SmallBytes(Vec::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::MediumBytes(_) => AlbaTypes::MediumBytes(Vec::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::BigSBytes(_) => AlbaTypes::BigSBytes(Vec::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::LargeBytes(_) => AlbaTypes::LargeBytes(Vec::new())
+                .try_from_existing(x.clone())
+                .unwrap_or(AlbaTypes::NONE),
+            AlbaTypes::NONE => AlbaTypes::NONE,
+        }
+    }
+}
 impl AlbaTypes {
     pub fn from_id(code: u8) -> Result<AlbaTypes, Error> {
         match code {

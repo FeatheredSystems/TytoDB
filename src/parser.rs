@@ -244,32 +244,6 @@ fn get_from_bushes_with_safety(bushes : &Vec<Token>,index : usize) -> Result<Tok
     match bushes.get(index){ Some(a) => Ok(a.clone()), None => return Err(gerr("Missing"))}
 }
 
-fn debug_qycnpvs(tokens : &Vec<Token>) -> Result<AST, Error> {
-    if let Some(ii) = tokens.get(1) {
-        if let Token::String(a) = ii{
-            return Ok(AST::QueryControlPrevious(AstQueryControlPrevious{id:a.to_string()}))
-        }
-    }
-    Err(gerr("Missing container"))
-}
-
-fn debug_qycnnxt(tokens : &Vec<Token>) -> Result<AST, Error> {
-    if let Some(ii) = tokens.get(1) {
-        if let Token::String(a) = ii{
-            return Ok(AST::QueryControlNext(AstQueryControlNext{id:a.to_string()}))
-        }
-    }
-    Err(gerr("Missing container"))
-}
-fn debug_qycnext(tokens : &Vec<Token>) -> Result<AST, Error> {
-    if let Some(ii) = tokens.get(1) {
-        if let Token::String(a) = ii{
-            return Ok(AST::QueryControlExit(AstQueryControlExit{id:a.to_string()}))
-        }
-    }
-    Err(gerr("Missing container"))
-}
-
 fn debug_search(tokens: &Vec<Token>) -> Result<AST, Error> {
     let container: Vec<AlbaContainer> = match tokens.get(3) {
         Some(s) => match s {
@@ -541,9 +515,6 @@ pub fn debug_tokens(tokens: &Vec<Token>) -> Result<AST, Error> {
             "SEARCH" => debug_search(tokens),
             "COMMIT"|"ROLLBACK" => debug_finishers_command(tokens),
             "DELETE" => debug_delete(tokens),
-            "QYCNPVS" => debug_qycnpvs(tokens),
-            "QYCNNXT" => debug_qycnnxt(tokens),
-            "QYCNEXT" => debug_qycnext(tokens),
             _ => Err(gerr("Invalid command keyword")),
         }
     } else {

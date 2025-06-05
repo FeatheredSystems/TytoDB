@@ -97,9 +97,6 @@ enum AST{
     Search(AstSearch),
     Commit(AstCommit),
     Rollback(AstRollback),
-    QueryControlNext(AstQueryControlNext),
-    QueryControlPrevious(AstQueryControlPrevious),
-    QueryControlExit(AstQueryControlExit),
 }
 
 

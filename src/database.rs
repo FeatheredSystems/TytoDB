@@ -483,7 +483,7 @@ impl Database{
                                     }
                                     val[ri] = AlbaTypes::Text(code.clone());
                                     let mut mvcc = container.mvcc.lock().await;
-                                    
+                                    loginfo!("code: {:?}",code);
                                     mvcc.1.insert(code, (false, s.to_string()));
                                 } else {
                                     
@@ -584,6 +584,7 @@ impl Database{
                                     crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
                                     crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
                                 }?;
+                                loginfo!("{:?}",values);
                                 let r = indexed_search(container.to_owned(), SearchArguments{
                                     element_size,
                                     header_offset: headers_offset as usize,
@@ -721,8 +722,8 @@ impl Database{
                         }
                     }.iter_mut().map(|f| {
                         loginfo!("Applying changes to row {:?}",f);
-                        for i in &changes {
-                            f.0.insert(i.0.clone(), i.1.clone());
+                        for (index, new_value) in &changes {
+                            f.0[*index] = new_value.clone();
                         }
                         f.to_owned()
                     }).collect()
@@ -741,8 +742,10 @@ impl Database{
                 loginfo!("MVCC locked");
                 loginfo!("MVCC updated with {} entries", result.len());
                 for i in result {
-                    loginfo!("Inserting row into MVCC | address: {}", i.1);
-                    mvcc.0.insert(i.1, (false, i.0));
+                    let ind = i.1.saturating_div(element_size as u64).saturating_add(headers_offset);
+                    loginfo!("ind: {}, i.1: {}",ind,i.1);
+                    loginfo!("Inserting row into MVCC | address: {}", ind);
+                    mvcc.0.insert(ind, (false, i.0));
                 }
             
                 loginfo!("EditRow completed successfully");
@@ -809,7 +812,9 @@ impl Database{
                 let container_book = container.lock().await;
                 let mut mvcc = container_book.mvcc.lock().await;
                 for i in result{
-                    mvcc.0.insert(i.1, (true,i.0));
+                    let k = (i.1-headers_offset)/element_size as u64;
+                    loginfo!("del-key: {:?}",k);
+                    mvcc.0.insert(k, (true,i.0));
                 }
 
                 loginfo!("del-row:p4");

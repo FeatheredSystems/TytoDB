@@ -170,32 +170,56 @@ impl Indexing{
 
         for (idx,v) in slots{
             let mut buffer = [0u8;INDEX_CHUNK_SIZE as usize * 16];
-            let offset = idx * INDEX_CHUNK_SIZE as usize;
-            index_file.read_exact_at(&mut buffer, offset as u64).unwrap();
-            let mut index_value_vector = Vec::with_capacity(INDEX_CHUNK_SIZE as usize);
+
+            let file_offset = idx as u64 * INDEX_CHUNK_SIZE * 16;
+            if index_file.read_exact_at(&mut buffer, file_offset).is_err() {
+                
+                continue;
+            };
+
+            let original_count = buffer.chunks_exact(16).filter(|&c| c != [0u8; 16]).count();
+            let mut item_found = false;
+
+            let mut index_value_vector: Vec<(u64, u64)> = Vec::with_capacity(original_count);
+
             for i in buffer.chunks_exact(16){
                 let index_value = u64::from_be_bytes(i[..8].try_into().unwrap());
-                let offset_value = u64::from_be_bytes(i[8..].try_into().unwrap());
-                if index_value == arg && arg_offset == offset_value{
+
+                
+                if index_value == 0 && i[8..] == [0u8; 8] {
                     continue;
-                }else{
-                    index_value_vector.push((index_value,offset_value))
+                }
+
+                let offset_value = u64::from_be_bytes(i[8..].try_into().unwrap());
+
+                if !item_found && index_value == arg && arg_offset == offset_value {
+                    item_found = true;
+                    continue;
+                } else {
+                    index_value_vector.push((index_value,offset_value));
                 }
             }
-            buffer = [0u8;INDEX_CHUNK_SIZE as usize * 16];
-            for i in index_value_vector.iter().enumerate(){
-                let index = i.0 * 16;
-                buffer[index..index+8].copy_from_slice(&i.1.0.to_be_bytes());
-                buffer[index+8..index+16].copy_from_slice(&i.1.1.to_be_bytes());
+            
+            
+            if item_found {
+                buffer = [0u8;INDEX_CHUNK_SIZE as usize * 16];
+                for (i, (val, off)) in index_value_vector.iter().enumerate(){
+                    let index = i * 16;
+                    buffer[index..index+8].copy_from_slice(&val.to_be_bytes());
+                    buffer[index+8..index+16].copy_from_slice(&off.to_be_bytes());
+                }
+
+                
+                index_file.write_all_at(&mut buffer, file_offset).unwrap();
+                
+                v.2 -= 1;
+                let mut metadata_buffer = [0u8;18];
+                metadata_buffer[..8].copy_from_slice(&v.0.to_be_bytes());
+                metadata_buffer[8..16].copy_from_slice(&v.1.to_be_bytes());
+                metadata_buffer[16..].copy_from_slice(&v.2.to_be_bytes());
+                meta_file.write_all_at(&mut metadata_buffer, idx as u64*18).unwrap();
+                *self.changes.lock().await = true;
             }
-            index_file.write_all_at(&mut buffer, INDEX_CHUNK_SIZE *(idx as u64 *16)).unwrap();
-            v.2 -= 1;
-            let mut metadata_buffer = [0u8;18];
-            metadata_buffer[..8].copy_from_slice(&v.0.to_be_bytes());
-            metadata_buffer[8..16].copy_from_slice(&v.1.to_be_bytes());
-            metadata_buffer[16..].copy_from_slice(&v.2.to_be_bytes());
-            meta_file.write_all_at(&mut metadata_buffer, idx as u64*18).unwrap();
-            *self.changes.lock().await = true;
         }
         Ok(())
     }
@@ -260,7 +284,6 @@ impl Search<Range<u64>> for Indexing {
 
             }
         }
-        
         Ok(offsets)
     }
 }
@@ -347,29 +370,30 @@ impl Search<u64> for Indexing {
 }
 
 
-pub trait GetIndex{
-    fn get_index(&self) -> u64;
-}
 
 impl GetIndex for i32{
     fn get_index(&self) -> u64{
-        *self as u64/INDEX_CHUNK_SIZE
+        ((*self ^ i32::MIN) as u64) / INDEX_CHUNK_SIZE
     }
 }
 impl GetIndex for i64{
     fn get_index(&self) -> u64{
-        *self as u64/INDEX_CHUNK_SIZE
+        ((*self ^ i64::MIN) as u64) / INDEX_CHUNK_SIZE
     }
 }
 impl GetIndex for i16{
     fn get_index(&self) -> u64{
-        *self as u64/INDEX_CHUNK_SIZE
+        ((*self ^ i16::MIN) as u64) / INDEX_CHUNK_SIZE
     }
 }
 impl GetIndex for i128{
     fn get_index(&self) -> u64{
-        *self as u64/INDEX_CHUNK_SIZE
+        ((*self ^ i128::MIN) as u64) / INDEX_CHUNK_SIZE
     }
+}
+
+pub trait GetIndex{
+    fn get_index(&self) -> u64;
 }
 impl GetIndex for u128{
     fn get_index(&self) -> u64{

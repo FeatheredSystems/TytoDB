@@ -216,19 +216,22 @@ pub async fn indexed_search(container: Arc<Mutex<Container>>, args: SearchArgume
                     data.insert(value.0.clone(), column_value);
                 }
                 Row { data }
-            }
+            },
             Err(e) => {
                 logerr!("Error deserializing row at offset {}: {}", offset, e);
                 return Err(e);
             }
         };
-        rows.push((row, *i));
+        if args.conditions.row_match(&row).unwrap(){
+            rows.push((row, *i));
+        }
         loginfo!("Row added | total rows: {}", rows.len());
     }
     loginfo!("Finished processing addresses | total rows collected: {}", rows.len());
     drop(file);
     loginfo!("File lock dropped");
 
+    loginfo!("rows: {}",rows.len());
     loginfo!("Building query");
     let mut query = Query::new(args.container_values.iter().map(|f| f.1.clone()).collect());
     let headers = container.column_names();
@@ -238,15 +241,14 @@ pub async fn indexed_search(container: Arc<Mutex<Container>>, args: SearchArgume
     }
     let v = container.columns();
     for i in rows {
-        if args.conditions.row_match(&i.0).unwrap() {
-            let mut r = v.clone();
-            for i in i.0.data.iter(){
-                if let Some(a) = header_map.get(i.0){
-                    r.insert(*a, i.1.to_owned());
-                }
+        let mut r = v.clone();
+        for i in i.0.data.iter(){
+            if let Some(a) = header_map.get(i.0){
+                r.insert(*a, i.1.to_owned());
             }
-            query.rows.1.push(r);
         }
+        query.rows.1.push(r);
+        
     }
 
     loginfo!("indexed_search completed successfully");
@@ -322,7 +324,7 @@ pub async fn search_direct(container: Arc<Mutex<Container>>, args: SearchArgumen
             };
             loginfo!("Row deserialized successfully for address: {}", row_address);
 
-            if args.conditions.row_match(&row)? {
+            if args.conditions.row_match(&row).unwrap() {
                 result.push((row.data.values().map(|f| f.to_owned()).collect(), row_address));
                 loginfo!("Row matched conditions, added to result | result size: {}", result.len());
             } else {
@@ -358,7 +360,7 @@ pub async fn indexed_search_direct(container: Arc<Mutex<Container>>, args: Searc
     for (idx, &row_address) in address.iter().enumerate() {
         loginfo!("Processing row {} | address: {}", idx, row_address);
         let mut buffer = vec![0u8; element_size];
-        let offset = row_address * element_size as u64;
+        let offset = row_address as u64;
         if offset > file_size {
             logerr!("WARNING: Bad offset | offset: {} size: {} index: {}", offset, file_size, row_address);
             continue;
@@ -390,7 +392,7 @@ pub async fn indexed_search_direct(container: Arc<Mutex<Container>>, args: Searc
                 let row = Row { data };
                 loginfo!("Row deserialized successfully");
 
-                if args.conditions.row_match(&row)? {
+                if args.conditions.row_match(&row).unwrap() {
                     loginfo!("Row matched conditions");
                     Some(row_content)
                 } else {

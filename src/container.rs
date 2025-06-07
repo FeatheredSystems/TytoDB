@@ -258,7 +258,8 @@ impl Container{
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         for (index, value) in mvcc.0.iter() {
             loginfo!("{}",index);
-            let v = (*index, value.1.clone());
+            let offset = (index * self.element_size as u64) + self.headers_offset;
+            let v = (offset, value.1.clone());
             if value.0 {
                 deletes.push(v);
             } else {
@@ -268,27 +269,28 @@ impl Container{
         mvcc.0.clear();
         insertions.sort_by_key(|(index, _)| *index);
         deletes.sort_by_key(|(index, _)| *index);
-        let hdr_off = self.headers_offset;
         let row_sz = self.element_size as u64;
         let buf = vec![0u8; self.element_size];
         let fi = self.file.lock().await;
         for (row_index, row_data) in insertions {
             let serialized = self.serialize_row(&row_data)?;
-            let offset = hdr_off + row_index * row_sz;
+            let offset = row_index;
             if let Some(arg) = row_data.first(){
                 let i = self.indexing.clone();
                 let j = offset.clone();
                 let idx = arg.get_index();
                 i.add(idx, j).await?;
             }
-            fi.write_all_at(serialized.as_slice(), offset)?;
+            loginfo!("wat {:?}",offset);
+            fi.write_all_at(serialized.as_slice(), offset).unwrap();
             //virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
         }
         
         let mut graveyard = self.graveyard.lock().await;
         for del in &deletes  {
             loginfo!("{}",del.0/row_sz);
-            let from = hdr_off + del.0;
+            let from = del.0;
+            loginfo!("from var {:?}",from);
             if let Some(arg) = del.1.first(){
                 let i = self.indexing.clone();
                 let j = from.clone();
@@ -333,96 +335,7 @@ impl Container{
         fi.sync_all().unwrap();
         Ok(())
     }
-    // pub async fn get_rows(&self, index: (u64, u64)) -> Result<Vec<Vec<AlbaTypes>>, Error> {
-    //     // INDEXES WILL BE TREATED AS RELATIVE, EACH BEING A REFERENCE TO (X*ELEMENT_SIZE) + header_size
-    //     let arrlen = self.arrlen_abs().await.unwrap();
-    //     let max = index.1.min(arrlen);
-    //     if index.0 > max{
-    //         return Err(gerr(&format!("Failed to get rows, the first index should be lower than the second. Review the arguments: (index0:{},index1:{})",index.0,index.1)))
-    //     }
-
-    //     let mut buffer = vec![0u8;(max.abs_diff(index.0)).max(1) as usize * self.element_size];
-    //     self.file.lock().await.read_exact_at(&mut buffer, (index.0 * self.element_size as u64)+self.headers_offset).unwrap();
-    //     println!("{}//{}",buffer.len(),self.len().await.unwrap());
-        
-    //     let mvcc = self.mvcc.lock().await;
-    //     let mut result : Vec<Vec<AlbaTypes>> = Vec::with_capacity((max-index.0) as usize);
-    //     for i in index.0..=max{
-    //         let index = i as usize;
-    //         if let Some(val) = mvcc.0.get(&i){
-    //             if !val.0{
-    //                 result.push(val.1.clone());
-    //                 continue;
-    //             }
-    //         }
-    //         if buffer.len() > self.element_size*index{
-    //             result.push(
-    //                 self.deserialize_row(
-    //                     &buffer[index*self.element_size .. (index+1)*self.element_size] // row-bytes
-    //                 ).await.unwrap() // row
-    //             );
-    //         }
-    //     }
-    //     Ok(result)
-    // }
     
-    /* 
-    pub async fn get_spread_rows(&mut self, index: &mut Vec<u64>) -> Result<Vec<Vec<AlbaTypes>>, Error> {
-        let maxl = if self.len().await? > self.headers_offset {
-            (self.len().await? - self.headers_offset) / self.element_size as u64
-        } else {
-            0
-        };
-        for i in index.iter_mut(){
-            if *i > maxl {
-                *i = maxl;
-            }
-        }
-        index.sort();
-        let mut buffers : BTreeMap<u64,Vec<u8>> = BTreeMap::new();
-        let mut result : Vec<Vec<AlbaTypes>> = Vec::new();
-        let mvcc = self.mvcc.lock().await;
-        for i in index{
-            if let Some(g) = mvcc.0.get(&i){
-                if !g.0{
-                    result.push(g.1.clone());
-                    continue;
-                }
-            }
-            buffers.insert(*i, vec![0u8;self.element_size]);
-        }
-        drop(mvcc);
-        let mut it = buffers.iter_mut();
-        while let Some(b) = it.next(){
-            
-            if let Some(c) = it.next(){
-                if *c.0-*b.0 < 10{
-                    let buff_size = ((*c.0 - *b.0 + 1) * self.element_size as u64) as usize;
-                    let mut buff = vec![0u8;buff_size];
-                    self.file.read_exact_at(&mut buff, (b.0*self.element_size as u64)+self.headers_offset)?;
-                    *b.1 = buff[0..self.element_size].to_vec();
-                    let c_off = ((*c.0-*b.0)*self.element_size as u64) as usize;
-                    *c.1 = buff[c_off..(c_off+self.element_size)].to_vec();
-                    result.push(self.deserialize_row(b.1.to_vec()).await?);
-                    result.push(self.deserialize_row(c.1.to_vec()).await?);
-                    continue;
-                }else{
-                    self.file.read_exact_at(b.1, (b.0*self.element_size as u64)+self.headers_offset)?;
-                    self.file.read_exact_at(c.1, (c.0*self.element_size as u64)+self.headers_offset)?;
-                    result.push(self.deserialize_row(b.1.to_vec()).await?);
-                    result.push(self.deserialize_row(c.1.to_vec()).await?);
-
-                    continue;
-                }
-            }
-            self.file.read_exact_at(b.1, (b.0*self.element_size as u64)+self.headers_offset)?;
-            result.push(self.deserialize_row(b.1.to_vec()).await?);
-        }
-        
-        result.shrink_to_fit();
-        Ok(result)
-    }
-    */
     pub fn columns(&self) -> Vec<AlbaTypes>{
         self.headers.iter().map(|v|v.1.clone()).collect()
     }

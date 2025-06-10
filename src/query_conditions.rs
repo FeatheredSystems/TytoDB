@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::{self, Error, ErrorKind}, mem::discriminant, ops::{Range, RangeInclusive}};
 
+use aes_gcm::aead::consts::U9223372036854775808;
 use ahash::AHashMap;
 use regex::{Regex, Replacer};
 
@@ -71,8 +72,28 @@ enum Operator{
     StringCaseInsensitiveContains,
     StringRegularExpression
 }
+impl Operator{
+    fn get_range(&self,ind : u64) -> LogicCell{
+        match self{
+            Operator::Equal | Operator::StrictEqual => {((ind,ind),(false,false),true)},
+            Operator::Greater => {((ind,0),(false,true),false)},
+            Operator::Lower => {((0,ind),(true,false),false)},
+            Operator::GreaterEquality => {((ind,0),(false,true),true)},
+            Operator::LowerEquality => {((0,ind),(true,false),true)},
+            Operator::Different => {((0,0),(false,false),false)},
+            Operator::StringContains => {((0,0),(false,false),false)},
+            Operator::StringCaseInsensitiveContains => {((0,0),(false,false),false)},
+            Operator::StringRegularExpression => {((0,0),(false,false),false)},
+        }
+    }
+}
 
+type LogicCell = ((u64,u64),(bool,bool),bool);
+// ranges | infinity<bool> | InclusiveRange
 
+/*  stuff I wanted to ask
+- can cpu be processed in gpu even while with horrible performance?
+*/
 impl QueryConditions{
     pub fn from_primitive_conditions(primitive_conditions : PrimitiveQueryConditions, column_properties : &HashMap<String,AlbaTypes>,primary_key : String) -> Result<Self,Error>{
         let mut chain : Vec<(QueryConditionAtom,Option<LogicalGate>)> = Vec::new();
@@ -256,42 +277,42 @@ impl QueryConditions{
         return Ok(QueryConditions { chain, primary_key : Some(primary_key)})
     }
     pub fn row_match(&self, row: &Row) -> Result<bool, Error> {
-        loginfo!("Starting row_match evaluation");
+        
         
         if self.chain.is_empty() {
-            loginfo!("Query chain is empty, returning true (matches all)");
+            
             return Ok(true);
         }
         
         let mut result = false;
         let mut regex_cache: AHashMap<String, Regex> = AHashMap::new();
         
-        loginfo!("Processing {} conditions in query chain", self.chain.len());
+        
     
         for (index, (query_condition, logical_gate)) in self.chain.iter().enumerate() {
             let column = &query_condition.column;
             let value = &query_condition.value;
             
-            loginfo!("Evaluating condition {} for column '{}'", index + 1, column);
+            
             
             let row_value = if let Some(val) = row.data.get(column) {
-                loginfo!("Found column '{}' in row data", column);
+                
                 val
             } else {
-                loginfo!("Column '{}' not found in row, skipping condition", column);
+                
                 continue;
             };
             
             let check = match query_condition.operator {
                 Operator::Equal | Operator::StrictEqual => {
-                    loginfo!("Performing equality check for column '{}'", column);
-                    loginfo!("Comparing values - Row value: {:?}, Query value: {:?}", row_value, value);
+                    
+                    
                     let result = *value == *row_value;
-                    loginfo!("Equality check result: {}", result);
+                    
                     result
                 },
                 Operator::Greater | Operator::GreaterEquality | Operator::Lower | Operator::LowerEquality => {
-                    loginfo!("Performing numeric comparison for column '{}'", column);
+                    
                     
                     let opd = discriminant(&query_condition.operator);
                     let equality = (opd == discriminant(&Operator::GreaterEquality)) || 
@@ -299,150 +320,79 @@ impl QueryConditions{
                     let lower = (opd == discriminant(&Operator::Lower)) || 
                                (opd == discriminant(&Operator::LowerEquality));
                     
-                    loginfo!("Comparison type: {} (equality: {}, lower: {})", 
-                            match query_condition.operator {
-                                Operator::Greater => "Greater",
-                                Operator::GreaterEquality => "GreaterEquality", 
-                                Operator::Lower => "Lower",
-                                Operator::LowerEquality => "LowerEquality",
-                                _ => "Unknown"
-                            }, equality, lower);
+                    
     
                     let comparison_result = match (row_value, value) {
                         (AlbaTypes::Int(x), AlbaTypes::Int(y)) => {
-                            loginfo!("Comparing Int({}) with Int({})", x, y);
+                            
                             let result = if lower { if equality { x <= y } else { x < y } } 
                             else { if equality { x >= y } else { x > y } };
-                            loginfo!("Int comparison result: {} {} {} = {}", x, 
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
+                            
                             result
                         },
                         (AlbaTypes::Bigint(x), AlbaTypes::Bigint(y)) => {
-                            loginfo!("Comparing Bigint({}) with Bigint({})", x, y);
+                            
                             let result = if lower { if equality { x <= y } else { x < y } } 
                             else { if equality { x >= y } else { x > y } };
-                            loginfo!("Bigint comparison result: {} {} {} = {}", x,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
                             result
                         },
                         (AlbaTypes::Float(x), AlbaTypes::Float(y)) => {
-                            loginfo!("Comparing Float({}) with Float({})", x, y);
+                            
                             let result = if lower { if equality { x <= y } else { x < y } } 
                             else { if equality { x >= y } else { x > y } };
-                            loginfo!("Float comparison result: {} {} {} = {}", x,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
+                            
                             result
                         },
                         (AlbaTypes::Int(x), AlbaTypes::Bigint(y)) => {
                             let x_promoted = *x as i64;
-                            loginfo!("Comparing Int({}) promoted to i64({}) with Bigint({})", x, x_promoted, y);
+                            
                             let result = if lower { if equality { x_promoted <= *y } else { x_promoted < *y } } 
                             else { if equality { x_promoted >= *y } else { x_promoted > *y } };
-                            loginfo!("Int->i64 vs Bigint comparison result: {} {} {} = {}", x_promoted,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
+                            
                             result
                         },
                         (AlbaTypes::Bigint(x), AlbaTypes::Int(y)) => {
                             let y_promoted = *y as i64;
-                            loginfo!("Comparing Bigint({}) with Int({}) promoted to i64({})", x, y, y_promoted);
+                            
                             let result = if lower { if equality { *x <= y_promoted } else { *x < y_promoted } } 
                             else { if equality { *x >= y_promoted } else { *x > y_promoted } };
-                            loginfo!("Bigint vs Int->i64 comparison result: {} {} {} = {}", x,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y_promoted, result);
+                            
                             result
                         },
                         (AlbaTypes::Int(x), AlbaTypes::Float(y)) => {
                             let x_promoted = *x as f64;
-                            loginfo!("Comparing Int({}) promoted to f64({}) with Float({})", x, x_promoted, y);
+                            
                             let result = if lower { if equality { x_promoted <= *y } else { x_promoted < *y } } 
                             else { if equality { x_promoted >= *y } else { x_promoted > *y } };
-                            loginfo!("Int->f64 vs Float comparison result: {} {} {} = {}", x_promoted,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
+                            
                             result
                         },
                         (AlbaTypes::Float(x), AlbaTypes::Int(y)) => {
                             let y_promoted = *y as f64;
-                            loginfo!("Comparing Float({}) with Int({}) promoted to f64({})", x, y, y_promoted);
+                            
                             let result = if lower { if equality { *x <= y_promoted } else { *x < y_promoted } } 
                             else { if equality { *x >= y_promoted } else { *x > y_promoted } };
-                            loginfo!("Float vs Int->f64 comparison result: {} {} {} = {}", x,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y_promoted, result);
+                            
                             result
                         },
                         (AlbaTypes::Bigint(x), AlbaTypes::Float(y)) => {
                             let x_promoted = *x as f64;
-                            loginfo!("Comparing Bigint({}) promoted to f64({}) with Float({})", x, x_promoted, y);
+                            
                             let result = if lower { if equality { x_promoted <= *y } else { x_promoted < *y } } 
                             else { if equality { x_promoted >= *y } else { x_promoted > *y } };
-                            loginfo!("Bigint->f64 vs Float comparison result: {} {} {} = {}", x_promoted,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y, result);
+                            
                             result
                         },
                         (AlbaTypes::Float(x), AlbaTypes::Bigint(y)) => {
                             let y_promoted = *y as f64;
-                            loginfo!("Comparing Float({}) with Bigint({}) promoted to f64({})", x, y, y_promoted);
+                            
                             let result = if lower { if equality { *x <= y_promoted } else { *x < y_promoted } } 
                             else { if equality { *x >= y_promoted } else { *x > y_promoted } };
-                            loginfo!("Float vs Bigint->f64 comparison result: {} {} {} = {}", x,
-                                    match query_condition.operator {
-                                        Operator::Greater => ">",
-                                        Operator::GreaterEquality => ">=",
-                                        Operator::Lower => "<",
-                                        Operator::LowerEquality => "<=",
-                                        _ => "?"
-                                    }, y_promoted, result);
+                            
                             result
                         },
                         _ => {
-                            loginfo!("Invalid type combination for numeric comparison - Row: {:?}, Query: {:?}", row_value, value);
+                            
                             return Err(gerr("Invalid type for numeric comparison"));
                         }
                     };
@@ -450,18 +400,17 @@ impl QueryConditions{
                     comparison_result
                 },
                 Operator::Different => {
-                    loginfo!("Performing inequality check for column '{}'", column);
-                    loginfo!("Comparing values for inequality - Row value: {:?}, Query value: {:?}", row_value, value);
+                    
+                    
                     let result = *value != *row_value;
-                    loginfo!("Inequality check result: {}", result);
+                    
                     result
                 },
                 Operator::StringContains | Operator::StringCaseInsensitiveContains => {
                     let case_insensitive = discriminant(&query_condition.operator) == 
                                           discriminant(&Operator::StringCaseInsensitiveContains);
                     
-                    loginfo!("Performing string contains check (case_insensitive: {}) for column '{}'", 
-                            case_insensitive, column);
+                    
                     
                     let row_string = match row_value {
                         AlbaTypes::Int(i) => i.to_string(),
@@ -470,7 +419,7 @@ impl QueryConditions{
                         AlbaTypes::SmallString(s) | AlbaTypes::MediumString(s) | 
                         AlbaTypes::BigString(s) | AlbaTypes::LargeString(s) => s.to_string(),
                         _ => {
-                            loginfo!("Invalid type for string operations - Row value: {:?}", row_value);
+                            
                             return Err(gerr("Invalid, the entered type cannot make string operations"));
                         }
                     };
@@ -482,25 +431,24 @@ impl QueryConditions{
                         AlbaTypes::SmallString(s) | AlbaTypes::MediumString(s) | 
                         AlbaTypes::BigString(s) | AlbaTypes::LargeString(s) => s.to_string(),
                         _ => {
-                            loginfo!("Invalid type for string operations - Query value: {:?}", value);
+                            
                             return Err(gerr("Invalid, the entered type cannot make string operations"));
                         }
                     };
     
                     let result = if case_insensitive {
-                        loginfo!("Checking if '{}' contains '{}' (case insensitive)", 
-                                row_string, value_string);
+                        
                         row_string.to_lowercase().contains(&value_string.to_lowercase())
                     } else {
-                        loginfo!("Checking if '{}' contains '{}'", row_string, value_string);
+                        
                         row_string.contains(&value_string)
                     };
                     
-                    loginfo!("String contains result: {}", result);
+                    
                     result
                 },
                 Operator::StringRegularExpression => {
-                    loginfo!("Performing regex match for column '{}'", column);
+                    
                     
                     let row_string = match row_value {
                         AlbaTypes::Int(i) => i.to_string(),
@@ -509,7 +457,7 @@ impl QueryConditions{
                         AlbaTypes::SmallString(s) | AlbaTypes::MediumString(s) | 
                         AlbaTypes::BigString(s) | AlbaTypes::LargeString(s) => s.to_string(),
                         _ => {
-                            loginfo!("Invalid type for string operations - Row value: {:?}", row_value);
+                            
                             return Err(gerr("Invalid, the entered type cannot make string operations"));
                         }
                     };
@@ -521,30 +469,30 @@ impl QueryConditions{
                         AlbaTypes::SmallString(s) | AlbaTypes::MediumString(s) | 
                         AlbaTypes::BigString(s) | AlbaTypes::LargeString(s) => s.to_string(),
                         _ => {
-                            loginfo!("Invalid type for string operations - Query value: {:?}", value);
+                            
                             return Err(gerr("Invalid, the entered type cannot make string operations"));
                         }
                     };
     
-                    loginfo!("Regex pattern: '{}', Target string: '{}'", value_string, row_string);
+                    
     
                     let regex_result = if let Some(cached_regex) = regex_cache.get(&value_string) {
-                        loginfo!("Using cached regex for pattern '{}'", value_string);
+                        
                         let match_result = cached_regex.is_match(&row_string);
-                        loginfo!("Regex match result (cached): {}", match_result);
+                        
                         match_result
                     } else {
-                        loginfo!("Compiling new regex for pattern '{}'", value_string);
+                        
                         let re = Regex::new(&value_string);
                         match re {
                             Ok(compiled_regex) => {
                                 let match_result = compiled_regex.is_match(&row_string);
-                                loginfo!("Regex compiled successfully, match result: {}", match_result);
+                                
                                 regex_cache.insert(value_string, compiled_regex);
                                 match_result
                             },
                             Err(e) => {
-                                loginfo!("Regex compilation failed: {}", e);
+                                
                                 return Err(gerr(&e.to_string()));
                             }
                         }
@@ -554,132 +502,181 @@ impl QueryConditions{
                 }
             };
             
-            loginfo!("Condition {} evaluation result: {}", index + 1, check);
+            
             
             if let Some(gate) = logical_gate {
-                loginfo!("Applying logical gate: {:?}", gate);
+                
                 match gate {
                     LogicalGate::And => {
                         if !check {
-                            loginfo!("AND gate with false condition, short-circuiting to false");
+                            
                             result = false;
                             break;
                         }
-                        loginfo!("AND gate with true condition, continuing");
+                        
                     },
                     LogicalGate::Or => {
                         if check {
-                            loginfo!("OR gate with true condition, short-circuiting to true");
+                            
                             result = true;
                             break;
                         }
-                        loginfo!("OR gate with false condition, continuing");
+                        
                     }
                 }
             } else {
-                loginfo!("No logical gate, setting result to condition result");
+                
                 result = check;
             }
         }
     
-        loginfo!("Final row_match result: {}", result);
+        
         Ok(result)
     }
     pub fn query_type(&self) -> Result<QueryType, Error> {
-        if self.chain.is_empty()  || self.primary_key.is_none(){
+        loginfo!("Starting query type analysis");
+        
+        // Early return for scan conditions
+        if self.chain.is_empty() || self.primary_key.is_none() {
+            loginfo!("No chain or primary key found, defaulting to Scan");
             return Ok(QueryType::Scan);
         }
-        let pk = self.primary_key.as_ref().unwrap();
-        let mut vector: Vec<(Operator,AlbaTypes)> = Vec::new();
-
-        let mut higher_range = Vec::new();
-        let mut lower_range = Vec::new();
-        let mut equality = false;
-
-        for i in self.chain.iter(){
-            if i.0.column == *pk{
-                vector.push((i.0.operator.clone(),i.0.value.clone()))
-            }
-        }
         
-        for i in vector{
-            if discriminant(&i.0) == discriminant(&Operator::Equal) || discriminant(&i.0) == discriminant(&Operator::StrictEqual){
-                if let AlbaTypes::Bigint(val) = i.1{
-                    return Ok(QueryType::Indexed(QueryIndexType::Strict(val.get_index())))
+        let pk = self.primary_key.as_ref().unwrap();
+        loginfo!("Primary key: {:?}, chain length: {}", pk, self.chain.len());
+        
+        let mut range: LogicCell = ((0, 0), (false, false), false);
+        let l = self.chain.len();
+        let mut logic_cells: Vec<LogicCell> = Vec::with_capacity(l);
+        let mut gates: Vec<bool> = Vec::with_capacity(l);
+        let mut range_mutated = false;
+        
+        let ad = discriminant(&LogicalGate::And);
+        
+        // Process chain into logic cells and gates
+        loginfo!("Processing {} chain elements", self.chain.len());
+        for (idx, i) in self.chain.iter().enumerate() {
+            if i.0.column != *pk {
+                loginfo!("Chain[{}]: Column {:?} != primary key, skipping", idx, i.0.column);
+                logic_cells.push(((0, 0), (false, false), false));
+            } else {
+                let index = i.0.value.get_index();
+                let cell = i.0.operator.get_range(index);
+                loginfo!("Chain[{}]: Primary key match, operator range: {:?}", idx, cell);
+                if !range_mutated{
+                    range = cell.clone();
+                    range_mutated = true;
                 }
-                if let AlbaTypes::Int(val) = i.1{
-                    return Ok(QueryType::Indexed(QueryIndexType::Strict(val.get_index())))
-                }
-                if let AlbaTypes::Float(val) = i.1{
-                    return Ok(QueryType::Indexed(QueryIndexType::Strict(val.get_index())))
-                }
-            }
-            if discriminant(&i.0) == discriminant(&Operator::Greater) || discriminant(&i.0) == discriminant(&Operator::GreaterEquality){
-                if let AlbaTypes::Bigint(val) = i.1{
-                    higher_range.push(val.get_index())
-                }
-                if let AlbaTypes::Int(val) = i.1{
-                    higher_range.push(val.get_index())
-                }
-                if let AlbaTypes::Float(val) = i.1{
-                    higher_range.push(val.get_index())
-                }
-                equality = (discriminant(&i.0) == discriminant(&Operator::GreaterEquality)) || equality;
-            }
-            if discriminant(&i.0) == discriminant(&Operator::Lower) || discriminant(&i.0) == discriminant(&Operator::LowerEquality){
-                if let AlbaTypes::Bigint(val) = i.1{
-                    lower_range.push(val.get_index())
-                }
-                if let AlbaTypes::Int(val) = i.1{
-                    lower_range.push(val.get_index())
-                }
-                if let AlbaTypes::Float(val) = i.1{
-                    lower_range.push(val.get_index())
-                }
-                equality = (discriminant(&i.0) == discriminant(&Operator::LowerEquality)) || equality;
-            }
-        }
-        let low_val = lower_range.iter().min().copied();
-        let high_val = higher_range.iter().max().copied();
-        loginfo!("{:?}~{:?}",low_val,high_val);
-        let b =match (low_val,high_val) {
-            (Some(l),Some(h)) => {
-                if !equality{
-                    Ok(
-                        QueryType::Indexed(QueryIndexType::Range(h..l))
-                    )
-                }else{
-                    Ok(
-                        QueryType::Indexed(QueryIndexType::InclusiveRange(h..=l))
-                    )
-                }
-            },
-            (Some(l),None) => {
-                Ok(
-                    if !equality{
-                        QueryType::Indexed(QueryIndexType::Range(0..l))
-                    }else{
-                        QueryType::Indexed(QueryIndexType::InclusiveRange(0..=l))
-                    }
-                )
-            }
-            ,
-            (None, Some(h)) => {
-                Ok(
-                    if !equality {
-                        QueryType::Indexed(QueryIndexType::InclusiveRange(h..=u64::MAX))
-                    } else {
-                        QueryType::Indexed(QueryIndexType::InclusiveRange(h..=u64::MAX))
-                    }
-                )
-            },
-            _ => {
-                Ok(QueryType::Scan)
+                logic_cells.push(cell);
             }
             
-        };
-        loginfo!("\n\n\n\n{:?}\n\n\n\n",b);
-        b
+            if let Some(logic_gate) = i.1 {
+                let is_and = ad == discriminant(&logic_gate);
+                loginfo!("Chain[{}]: Logic gate: {:?} (is_and: {})", idx, logic_gate, is_and);
+                gates.push(is_and);
+            }
+        }
+
+        loginfo!("Combining logic cells with gates");
+        for (idx, (cell, gate)) in logic_cells.iter().zip(gates.iter()).enumerate() {
+            loginfo!("Processing cell[{}]: {:?} with gate: {}", idx, cell, gate);
+            
+            if range == ((0, 0), (false, false), false) {
+                loginfo!("First valid range, setting initial: {:?}", cell);
+                range = *cell;
+                continue;
+            }
+            
+            if *gate { // AND operation
+                loginfo!("AND operation - intersecting ranges");
+                
+                // Handle null flag
+                if range.2 != cell.2 && cell.2 {
+                    loginfo!("Setting null flag from cell");
+                    range.2 = cell.2;
+                }
+                
+                // Intersect upper bound
+                if range.0.1 == 0 && range.1.1 == true && cell.0.1 != 0 && cell.1.1 == false {
+                    loginfo!("Updating upper bound from cell: {} -> {}", range.0.1, cell.0.1);
+                    range.0.1 = cell.0.1;
+                    range.1.1 = false;
+                }
+                
+                // Intersect lower bound
+                if range.0.0 == 0 && range.1.0 == true && cell.0.0 != 0 && cell.1.0 == false {
+                    loginfo!("Updating lower bound from cell: {} -> {}", range.0.0, cell.0.0);
+                    range.0.0 = cell.0.0;
+                    range.1.0 = false;
+                }
+            } else { // OR operation
+                loginfo!("OR operation - union of ranges");
+                
+                // Handle null flag
+                if range.2 || cell.2 {
+                    loginfo!("Setting null flag due to OR");
+                    range.2 = true;
+                }
+                
+                // Expand lower bound (take minimum)
+                if cell.0.0 != 0 && (range.0.0 == 0 || cell.0.0 < range.0.0) {
+                    loginfo!("Expanding lower bound: {} -> {}", range.0.0, cell.0.0);
+                    range.0.0 = cell.0.0;
+                    range.1.0 = cell.1.0;
+                }
+                
+                // Expand upper bound (take maximum)
+                if cell.0.1 != 0 && (range.0.1 == 0 || cell.0.1 > range.0.1) {
+                    loginfo!("Expanding upper bound: {} -> {}", range.0.1, cell.0.1);
+                    range.0.1 = cell.0.1;
+                    range.1.1 = cell.1.1;
+                }
+            }
+            
+            loginfo!("Range after processing cell[{}]: {:?}", idx, range);
+        }
         
+        // Normalize range bounds
+        if range.0.0 == 0 && range.1.0 {
+            loginfo!("Normalizing lower bound to 0 (inclusive)");
+            range.0.0 = 0;
+            range.1.0 = false;
+        }
+        if range.0.1 == 0 && range.1.1 {
+            loginfo!("Normalizing upper bound to MAX (exclusive)");
+            range.0.1 = u64::MAX;
+            range.1.1 = false;
+        }
+        
+        loginfo!("Final range: {:?}", range);
+        
+        // Determine query type based on final range
+        if range == ((0, 0), (false, false), false) {
+            loginfo!("Empty range, returning Scan");
+            return Ok(QueryType::Scan);
+        }
+        
+        if range.0.0 > range.0.1 {
+            loginfo!("Invalid range (lower > upper), returning Scan");
+            return Ok(QueryType::Scan);
+        }
+        
+        if range.2 && range.0.0 == range.0.1 {
+            loginfo!("Strict index query for value: {}", range.0.0);
+            return Ok(QueryType::Indexed(QueryIndexType::Strict(range.0.0)));
+        }
+        
+        if range.2 && range.0.0 != range.0.1 {
+            loginfo!("Inclusive range query: {}..={}", range.0.0, range.0.1);
+            return Ok(QueryType::Indexed(QueryIndexType::InclusiveRange(range.0.0..=range.0.1)));
+        }
+        
+        if !range.2 && range.0.0 != range.0.1 {
+            loginfo!("Exclusive range query: {}..{}", range.0.0, range.0.1);
+            return Ok(QueryType::Indexed(QueryIndexType::Range(range.0.0..range.0.1)));
+        }
+        
+        loginfo!("Fallback to Scan query type");
+        Ok(QueryType::Scan)
     }
 }

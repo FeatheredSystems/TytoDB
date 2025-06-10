@@ -483,7 +483,7 @@ impl Database{
                                     }
                                     val[ri] = AlbaTypes::Text(code.clone());
                                     let mut mvcc = container.mvcc.lock().await;
-                                    loginfo!("code: {:?}",code);
+                                    
                                     mvcc.1.insert(code, (false, s.to_string()));
                                 } else {
                                     
@@ -531,7 +531,7 @@ impl Database{
             AST::Search(structure) => {
                 let mut query : Option<Query> = None;
                 for i in structure.container{
-                    loginfo!("search-row:p1");
+                    
                     if let AlbaContainer::Virtual(virt) = i{
                         let ast = debug_tokens(&virt)?;
                         let result_query = Box::pin(self.run(ast)).await?;
@@ -542,7 +542,7 @@ impl Database{
                         }
                         continue;
                     }
-                    loginfo!("search-row:p2");
+                    
                     if let AlbaContainer::Real(container_name) = i{
                         let container = match self.container.get(&container_name){
                             Some(a) => a,
@@ -551,7 +551,7 @@ impl Database{
                         let container_book = container.lock().await;
                         let header_types = container_book.headers.clone();
 
-                        loginfo!("search-row:p3");
+                        
                         let mut headers_hash_map = HashMap::new();
                         for i in header_types.iter().cloned(){
                             headers_hash_map.insert(i.0,i.1);
@@ -565,7 +565,7 @@ impl Database{
                         drop(container_book);
                         let result = match qt{
                             QueryType::Scan => { 
-                                loginfo!("search-row:p3.1-");
+                                
                                 let r = search(container.to_owned(), SearchArguments{
                                     element_size,
                                     header_offset: headers_offset as usize,
@@ -573,18 +573,18 @@ impl Database{
                                     container_values: header_types,
                                     conditions: qc,
                                 }).await.unwrap();
-                                loginfo!("search-row:p3.1");
+                                
                                 r
                             },
                             QueryType::Indexed(query_index_type) => {
 
-                                loginfo!("search-row:p3.2-");
+                                
                                 let values = match query_index_type{
                                     crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
                                     crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
                                     crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
                                 }?;
-                                loginfo!("{:?}",values);
+                                loginfo!("values: {:?}",values);
                                 let r = indexed_search(container.to_owned(), SearchArguments{
                                     element_size,
                                     header_offset: headers_offset as usize,
@@ -593,12 +593,12 @@ impl Database{
                                     conditions: qc,
                                 },&values).await.unwrap();
 
-                                loginfo!("search-row:p3.2");
+                                
                                 r
                             }
                         };
 
-                        loginfo!("search-row:p4");
+                        
                         match query{
                             Some(ref mut b) => b.join(result),
                             None => {query = Some(result)}
@@ -612,10 +612,10 @@ impl Database{
                 }
             },
             AST::EditRow(structure) => {
-                loginfo!("Starting EditRow | container: {}", structure.container);
+                
                 let container = match self.container.get(&structure.container) {
                     Some(a) => {
-                        loginfo!("Found container: {}", structure.container);
+                        
                         a
                     }
                     None => {
@@ -624,23 +624,23 @@ impl Database{
                     }
                 };
             
-                loginfo!("Locking container for headers...");
+                
                 let header_types = {
                     let container_book = container.lock().await;
-                    loginfo!("Container locked for headers");
+                    
                     container_book.headers.clone()
                 };
-                loginfo!("Retrieved {} headers", header_types.len());
+                
             
-                loginfo!("Building headers hash map");
+                
                 let mut headers_hash_map = HashMap::new();
                 for i in header_types.iter().cloned() {
                     headers_hash_map.insert(i.0, i.1);
                 }
-                loginfo!("Headers hash map built with {} entries", headers_hash_map.len());
+                
             
-                loginfo!("Creating QueryConditions");
-                loginfo!("Primitive conditions: {:?}",structure.conditions);
+                
+                
                 let qc = QueryConditions::from_primitive_conditions(
                     structure.conditions.clone(),
                     &headers_hash_map,
@@ -652,12 +652,12 @@ impl Database{
                     }
                 ).unwrap();
             
-                loginfo!("Locking container for query execution...");
+                
                 let container_book = container.lock().await;
-                loginfo!("Container locked for query execution");
+                
                 let qt = qc.query_type().unwrap();
             
-                loginfo!("Building column name index and changes map");
+                
                 let mut column_name_idx: AHashMap<String, usize> = AHashMap::new();
                 let mut changes: AHashMap<usize, AlbaTypes> = AHashMap::new();
                 for i in container_book.headers.iter().enumerate() {
@@ -673,20 +673,20 @@ impl Database{
                     let id = column_name_idx.get(i.1).unwrap();
                     changes.insert(*id, val.to_owned());
                 }
-                loginfo!("Column name index built with {} entries, changes map with {} entries", column_name_idx.len(), changes.len());
+                
             
                 let element_size = container_book.element_size.clone();
                 let headers_offset = container_book.headers_offset.clone();
                 let file = container_book.file.clone();
                 let indexing = container_book.indexing.clone();
-                loginfo!("Preparing search | element_size: {}, headers_offset: {}", element_size, headers_offset);
+                
                 drop(container_book);
-                loginfo!("Container lock dropped");
+                
             
                 let result: Vec<(Vec<AlbaTypes>, u64)> = {
                     match qt {
                         QueryType::Scan => {
-                            loginfo!("Performing search_direct");
+                            
                             search_direct(container.clone(), SearchArguments {
                                 element_size,
                                 header_offset: headers_offset as usize,
@@ -696,22 +696,22 @@ impl Database{
                             }).await.unwrap()
                         }
                         QueryType::Indexed(query_index_type) => {
-                            loginfo!("Performing indexed_search_direct");
+                            
                             let values = match query_index_type {
                                 crate::query_conditions::QueryIndexType::Strict(t) => {
-                                    loginfo!("Searching index: Strict({:?})", t);
+                                    
                                     indexing.search(t).await
                                 }
                                 crate::query_conditions::QueryIndexType::Range(t) => {
-                                    loginfo!("Searching index: Range({:?})", t);
+                                    
                                     indexing.search(t).await
                                 }
                                 crate::query_conditions::QueryIndexType::InclusiveRange(t) => {
-                                    loginfo!("Searching index: InclusiveRange({:?})", t);
+                                    
                                     indexing.search(t).await
                                 }
                             }.unwrap();
-                            loginfo!("Index search returned {} values", values.len());
+                            
                             indexed_search_direct(container.clone(), SearchArguments {
                                 element_size,
                                 header_offset: headers_offset as usize,
@@ -721,37 +721,37 @@ impl Database{
                             }, &values).await.unwrap()
                         }
                     }.iter_mut().map(|f| {
-                        loginfo!("Applying changes to row {:?}",f);
+                        
                         for (index, new_value) in &changes {
                             f.0[*index] = new_value.clone();
                         }
                         f.to_owned()
                     }).collect()
                 };
-                loginfo!("Search completed | result rows: {}", result.len());
+                
             
-                loginfo!("Locking container for MVCC update...");
+                
                 let container_book = container.lock().await;
-                loginfo!("Container locked for MVCC update");
+                
                 let mvcc = container_book.mvcc.clone();
                 drop(container_book);
-                loginfo!("Container lock dropped");
+                
             
-                loginfo!("Locking MVCC...");
+                
                 let mut mvcc = mvcc.lock().await;
-                loginfo!("MVCC locked");
-                loginfo!("MVCC updated with {} entries", result.len());
+                
+                
                 for i in result {
-                    let ind = i.1.saturating_div(element_size as u64).saturating_add(headers_offset);
-                    loginfo!("ind: {}, i.1: {}",ind,i.1);
-                    loginfo!("Inserting row into MVCC | address: {}", ind);
+                    let ind = i.1.saturating_sub(headers_offset).saturating_div(element_size as u64);
+                    
+                    
                     mvcc.0.insert(ind, (false, i.0));
                 }
             
-                loginfo!("EditRow completed successfully");
+                
             },
             AST::DeleteRow(structure) => {
-                loginfo!("del-row:p1");
+                
                 let container = match self.container.get(&structure.container){
                     Some(a) => a,
                     None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",structure.container)))}
@@ -762,7 +762,7 @@ impl Database{
                 for i in header_types.iter().cloned(){
                     headers_hash_map.insert(i.0,i.1);
                 }
-                loginfo!("del-row:p2");
+                
                 let qc = QueryConditions::from_primitive_conditions( if let Some(c) = structure.conditions{c}else{(Vec::new(),Vec::new())}, &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))})?;
                 let container_book = container.lock().await;
                 let element_size = container_book.element_size.clone();
@@ -770,11 +770,11 @@ impl Database{
                 let file = container_book.file.clone();
                 let indexing = container_book.indexing.clone();
                 let qt = qc.query_type()?;
-                loginfo!("del-row:p2.5");
+                
                 drop(container_book);
                 let result : Vec<(Vec<AlbaTypes>,u64)> = match qt{
                     QueryType::Scan => { 
-                        loginfo!("del-row:p2.5.0");
+                        
                         let r = search_direct(container.clone(), SearchArguments{
                             element_size,
                             header_offset: headers_offset as usize,
@@ -783,19 +783,19 @@ impl Database{
                             conditions: qc,
                         }).await?;
                         
-                        loginfo!("del-row:p2.5.1");
+                        
                         r
                     }
                     QueryType::Indexed(query_index_type) => {
 
-                        loginfo!("del-row:p2.5.5");
+                        
                         let values = match query_index_type{
                             crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
                             crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
                             crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
                         }?;
 
-                        loginfo!("del-row:p2.5.6");
+                        
                         let r= indexed_search_direct(container.clone(), SearchArguments{
                             element_size,
                             header_offset: headers_offset as usize,
@@ -804,20 +804,20 @@ impl Database{
                             conditions: qc,
                         },&values).await?;
 
-                        loginfo!("del-row:p2.5.7");
+                        
                         r
                     }
                 };
-                loginfo!("del-row:p3");
+                
                 let container_book = container.lock().await;
                 let mut mvcc = container_book.mvcc.lock().await;
                 for i in result{
                     let k = (i.1-headers_offset)/element_size as u64;
-                    loginfo!("del-key: {:?}",k);
+                    
                     mvcc.0.insert(k, (true,i.0));
                 }
 
-                loginfo!("del-row:p4");
+                
             },
             AST::DeleteContainer(structure) => {
                 
@@ -836,11 +836,9 @@ impl Database{
                     self.container.remove(&structure.container);
                     
                     let path = format!("{}/{}", self.location, structure.container);
-                    tokio::fs::remove_file(path.clone()).await?;
-                    let path = format!("{}/{}.cindex", self.location, structure.container);
-                    tokio::fs::remove_file(path.clone()).await?;
-                    let path = format!("{}/{}.cimeta", self.location, structure.container);
-                    tokio::fs::remove_file(path.clone()).await?;
+                    let _ = tokio::fs::remove_file(path.clone()).await;
+                    let path = format!("{}/{}.index", self.location, structure.container);
+                    let _ = tokio::fs::remove_file(path.clone()).await;
                     
                     self.save_containers()?;
                     

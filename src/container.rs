@@ -257,7 +257,7 @@ impl Container{
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         for (index, value) in mvcc.0.iter() {
-            loginfo!("{}",index);
+            
             let offset = (index * self.element_size as u64) + self.headers_offset;
             let v = (offset, value.1.clone());
             if value.0 {
@@ -269,7 +269,6 @@ impl Container{
         mvcc.0.clear();
         insertions.sort_by_key(|(index, _)| *index);
         deletes.sort_by_key(|(index, _)| *index);
-        let row_sz = self.element_size as u64;
         let buf = vec![0u8; self.element_size];
         let fi = self.file.lock().await;
         for (row_index, row_data) in insertions {
@@ -279,27 +278,29 @@ impl Container{
                 let i = self.indexing.clone();
                 let j = offset.clone();
                 let idx = arg.get_index();
-                i.add(idx, j).await?;
+                i.add(idx, j).await.unwrap();
             }
-            loginfo!("wat {:?}",offset);
+            
             fi.write_all_at(serialized.as_slice(), offset).unwrap();
             //virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
         }
         
         let mut graveyard = self.graveyard.lock().await;
-        for del in &deletes  {
-            loginfo!("{}",del.0/row_sz);
-            let from = del.0;
-            loginfo!("from var {:?}",from);
+        
+        for del in &deletes {
+            let offset = del.0;
+            let row_index = (offset - self.headers_offset) / self.element_size as u64;
+            fi.write_all_at(&buf, offset).unwrap();
+            graveyard.insert(row_index);  // Store row index
             if let Some(arg) = del.1.first(){
                 let i = self.indexing.clone();
-                let j = from.clone();
+                let j = offset.clone();
                 let idx = arg.get_index();
                 i.remove(idx, j).await.unwrap();
             }
+            loginfo!("offset: {}",offset);
+            loginfo!("row_index: {}",row_index);
             
-            fi.write_all_at(&buf, from).unwrap();
-            graveyard.insert(del.0);
         }
         
 
@@ -343,7 +344,7 @@ impl Container{
         let mut buffer = Vec::with_capacity(self.element_size);
     
         for (item, ty) in row.iter().zip(self.columns().iter()) {
-            loginfo!("item: {:?} | ty: {:?}",discriminant(item),discriminant(ty));
+            
             let item = &AlbaTypes::to_another(item, ty);
             match (item, ty) {
                 (AlbaTypes::Bigint(v), AlbaTypes::Bigint(_)) => {
@@ -481,28 +482,7 @@ impl Container{
     
                 // Text types
                 AlbaTypes::Text(_) => {
-                    let size = self.str_size;
-                    let bytes = buf[index..index+size].to_vec();
-                    index += size;
-                    let trimmed: Vec<u8> = bytes.into_iter()
-                        .take_while(|&b| b != 0)
-                        .collect();
-                    let str_id = String::from_utf8(trimmed)
-                        .map_err(|e| gerr(&format!("Text decoding failed: {}", e)))?;
-    
-                    // Check external text storage
-                    let mut file = match try_open_file(&format!("{}/rf/{}", self.location, str_id)).await? {
-                        Some(f) => f,
-                        None => {
-                            values.push(AlbaTypes::Text(str_id));
-                            continue;
-                        }
-                    };
-    
-                    let mut content = Vec::new();
-                    file.read_to_end(&mut content).await?;
-                    values.push(AlbaTypes::Text(String::from_utf8(content)
-                        .map_err(|e| gerr(&format!("Text file corrupt: {}", e)))?));
+                    values.push(AlbaTypes::Text(String::new()));
                 },
     
                 // Fixed-size string types

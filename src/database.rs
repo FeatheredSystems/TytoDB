@@ -454,73 +454,21 @@ impl Database{
                         structure.col_val.len()
                     )));
                 }
-                for i in &structure.col_nam {
-                    if !container.column_names().contains(&i) {
-                        
-                        return Err(gerr(&format!("There is no column {} in the container {}", i, structure.container)));
+                let mut val : Vec<AlbaTypes> = container.columns();
+                let cols = container.columns();
+                let mut hm = AHashMap::new();
+                for i in container.headers.iter().enumerate(){
+                    hm.insert(i.1.0.clone(),i.0);
+                }
+
+                for i in structure.col_nam.iter().enumerate(){
+                    let j = hm.get(i.1);
+                    if let Some(a) = j{
+                        val.insert(*a,structure.col_val[i.0].clone().try_from_existing(cols[*a].clone())?);
                     }
                 }
-                let mut val: Vec<AlbaTypes> = container.columns();
-                
-                for (index, col_name) in structure.col_nam.iter().enumerate() {
-                    match container.column_names().iter().position(|c| c == col_name) {
-                        Some(ri) => {
-                            let input_val = structure.col_val.get(index).cloned().unwrap();
-                            let expected_val = &container.columns()[ri];
-                            
-                            if let AlbaTypes::NONE = &input_val {
-                                val[ri] = AlbaTypes::NONE;
-                                
-                            } else if let AlbaTypes::Text(_) = expected_val {
-                                if let AlbaTypes::Text(s) = &input_val {
-                                    let mut code = generate_secure_code(MAX_STR_LEN);
-                                    let txt_path = format!("{}/rf/{}", self.location, code);
-                                    
-                                    while fs::exists(&txt_path)? {
-                                        let code_full = generate_secure_code(MAX_STR_LEN);
-                                        code = code_full.chars().take(MAX_STR_LEN).collect::<String>();
-                                        
-                                    }
-                                    val[ri] = AlbaTypes::Text(code.clone());
-                                    let mut mvcc = container.mvcc.lock().await;
-                                    
-                                    mvcc.1.insert(code, (false, s.to_string()));
-                                } else {
-                                    
-                                    return Err(gerr(&format!(
-                                        "For column '{}', expected Text, but got {:?}.",
-                                        col_name, input_val
-                                    )));
-                                }
-                            } else if std::mem::discriminant(&input_val) == std::mem::discriminant(expected_val) {
-                                val[ri] = input_val;
-                                
-                            } else {
-                                match expected_val.try_from_existing(input_val.clone()) {
-                                    Ok(converted_val) => {
-                                        val[ri] = converted_val;
-                                        
-                                    },
-                                    Err(e) => {
-                                        
-                                        return Err(gerr(&format!(
-                                            "Type conversion error for column '{}': expected {:?}, got {:?}. Error: {}",
-                                            col_name, expected_val, input_val, e
-                                        )));
-                                    }
-                                }
-                            }
-                        },
-                        None => {
-                            
-                            return Err(gerr(&format!(
-                                "Column '{}' not found in container '{}'.",
-                                col_name, structure.container
-                            )));
-                        }
-                    }
-                }
-                
+
+
                 container.push_row(&val).await?;
                 if self.settings.auto_commit {
                     

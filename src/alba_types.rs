@@ -470,7 +470,7 @@ impl TryFrom<Token> for AlbaTypes {
                 })
             },
             Token::String(s) =>
-                Ok(AlbaTypes::Text(s)), // moved, no clone
+                Ok(AlbaTypes::LargeString(s)), // moved, no clone
 
             Token::Int(i) if (i32::MIN as i64) <= i && i <= (i32::MAX as i64) =>
                 Ok(AlbaTypes::Int(i as i32)),

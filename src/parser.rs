@@ -36,19 +36,43 @@ fn parser_debugger_extract_group_elstr(output : &mut Vec<String>,list : &Vec<Tok
     }
     None
 }
-fn parser_debugger_extract_group_albatype(output: &mut Vec<AlbaTypes>, list: &[Token], index: usize) -> Option<Error> {
+fn parser_debugger_extract_group_albatype(
+    output: &mut Vec<AlbaTypes>,
+    list: &[Token],
+    index: usize
+) -> Option<Error> {
     if let Some(token) = list.get(index) {
         match token {
             Token::Group(g) => {
                 for item in g {
-                    match AlbaTypes::try_from(item.clone()) {
-                        Ok(value) => output.push(value),
-                        Err(e) => return Some(gerr(&format!("{}",e))),
+                    match item {
+                        Token::String(s) => {
+                            let ty = match s.to_uppercase().as_str() {
+                                "INT" => AlbaTypes::Int(0),
+                                "BIGINT" => AlbaTypes::Bigint(0),
+                                "FLOAT" => AlbaTypes::Float(0.0),
+                                "BOOL" => AlbaTypes::Bool(false),
+                                "TEXT" => AlbaTypes::Text(String::new()),
+                                "NANO-STRING" => AlbaTypes::NanoString(String::new()),
+                                "SMALL-STRING" => AlbaTypes::SmallString(String::new()),
+                                "MEDIUM-STRING" => AlbaTypes::MediumString(String::new()),
+                                "BIG-STRING" => AlbaTypes::BigString(String::new()),
+                                "LARGE-STRING" => AlbaTypes::LargeString(String::new()),
+                                "NANO-BYTES" => AlbaTypes::NanoBytes(Vec::new()),
+                                "SMALL-BYTES" => AlbaTypes::SmallBytes(Vec::new()),
+                                "MEDIUM-BYTES" => AlbaTypes::MediumBytes(Vec::new()),
+                                "BIG-BYTES" => AlbaTypes::BigSBytes(Vec::new()),
+                                "LARGE-BYTES" => AlbaTypes::LargeBytes(Vec::new()),
+                                _ => return Some(gerr(&format!("Unknown type: {}", s))),
+                            };
+                            output.push(ty);
+                        },
+                        _ => return Some(gerr("Expected string for column type")),
                     }
                 }
                 None
-            }
-            _ => Some(gerr("Missing column types")),
+            },
+            _ => Some(gerr("Missing column types group")),
         }
     } else {
         Some(gerr("Missing token for column types"))

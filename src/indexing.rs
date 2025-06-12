@@ -1,6 +1,6 @@
 use tokio::sync::{Mutex, RwLock};
 use crate::{alba_types::AlbaTypes, database::database_path, gerr, logerr, loginfo};
-use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{self, File, OpenOptions}, hash::{DefaultHasher, Hash, Hasher}, io::{Error, Write}, ops::{Range, RangeInclusive}, os::unix::fs::{FileExt, MetadataExt}, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{self, File, OpenOptions}, hash::{DefaultHasher, Hash, Hasher}, io::{Error, Read, Write}, ops::{Range, RangeInclusive}, os::unix::fs::{FileExt, MetadataExt}, sync::Arc, time::Duration};
 
 
 //type IndexElement = (u64,u64); // index value , offset value
@@ -57,7 +57,7 @@ fn index_page_from_b(b : [u8;PAGE_SIZE as usize]) -> IndexPage{
         let mut key = [0u8;8];
         let mut address = [0u8;8];
         key.clone_from_slice(&i[..8]);
-        address.clone_from_slice(&i[..8]);
+        address.clone_from_slice(&i[8..]);
         elements.push((u64::from_be_bytes(key),u64::from_be_bytes(address)))
     }
 
@@ -74,7 +74,8 @@ fn index_page_to_b(page: &IndexPage) -> [u8; PAGE_SIZE as usize] {
     
     let count_bytes = page.count.to_be_bytes();
     b[16..18].copy_from_slice(&count_bytes);
-    
+    loginfo!("{:?}", page.elements);
+
     let mut offset = 18;
     for (key, address) in &page.elements {
         let key_bytes = key.to_be_bytes();
@@ -108,8 +109,8 @@ impl Indexing{
         if fs::exists(&path)?{
             return Ok(())
         }else{
-            let file = fs::File::create_new(path)?;
-            file.write_all_at(&mut new_empty_page(), 0)?;
+            let mut file = fs::File::create_new(path)?;
+            file.write_all(&mut new_empty_page())?;
             file.sync_all()?;
         }
         Ok(())
@@ -125,13 +126,13 @@ impl Indexing{
         let mut available = 0;
         for i in 0..pages{
             let mut buf = [0u8;PAGE_SIZE as usize];
-            file.read_exact_at(&mut buf, i*PAGE_SIZE)?;
+            file.read_exact_at(&mut buf, i*PAGE_SIZE).unwrap();
             let page = index_page_from_b(buf);
             if page.count < 6388{
                 available = i as usize;
             }
             metadata.push((page.range,i*PAGE_SIZE));
-            
+            loginfo!("load_index-i: {}",i);
         }
         Ok(Arc::new(Indexing{file:Arc::new(Mutex::new(file)),metadata:Arc::new(Mutex::new(metadata)), available_page: Arc::new(Mutex::new(available))}))
     }
@@ -144,9 +145,14 @@ impl Indexing{
         if let Some(val) = metadata.get(available){
             let offset = val.1;
             let file = self.file.lock().await;
+            loginfo!("read_offset: {}",offset);
             let mut buf = [0u8;PAGE_SIZE as usize];
-            file.read_exact_at(&mut buf, offset)?;
+            file.read_exact_at(&mut buf, offset).unwrap();
             let mut page: IndexPage = index_page_from_b(buf);
+            
+            page.elements.retain(|f|f.1!=arg_offset);
+            loginfo!("arg: {} offset: {}",arg,arg_offset);
+            
             page.elements.push((arg,arg_offset));
             page.elements.sort_by_key(|f|f.0);
             page.count = page.elements.len() as u16;
@@ -159,16 +165,18 @@ impl Indexing{
                 }
             }
             let size = file.metadata()?.size();
-            metadata[available] = (page.range.clone(),size.clone());
-            let bytes = index_page_to_b(&page);
+            metadata[available] = (page.range.clone(),offset);
+            let bytes: [u8; PAGE_SIZE as usize] = index_page_to_b(&page);
             file.write_all_at(&bytes, offset)?;
             if page.count == ELEMENT_COUNT{
                 let i = metadata.len();
-                let nep = new_empty_page();
+                let nep: [u8; 102226] = new_empty_page();
                 metadata.push((page.range,size));
+                file.set_len(size+102226)?;
                 file.write_all_at(&nep, size)?;
                 *self.available_page.lock().await = i;
             }
+            loginfo!("{:?}",metadata);
             drop(metadata);
             file.sync_all()?;
         }
@@ -186,7 +194,7 @@ impl Indexing{
                 let mut page: IndexPage = index_page_from_b(buf);
                 
                 let original_len = page.elements.len();
-                page.elements.retain(|(key, offset_val)| !(*key == arg && *offset_val == arg_offset));
+                page.elements.retain(|(key, offset_val)| !(*key == arg || *offset_val == arg_offset));
                 
                 if page.elements.len() < original_len {
                     page.count = page.elements.len() as u16;
@@ -238,13 +246,14 @@ impl Search<Range<u64>> for Indexing {
         let mut results = BTreeSet::new();
         let metadata = self.metadata.lock().await;
         let file = self.file.lock().await;
-        
+        loginfo!("\nmetadata: {:?}\n",metadata);
         for (_page_idx, (range, offset)) in metadata.iter().enumerate() {
             // Check if page range overlaps with search range
-            if range.start() < &arg.end && range.end() >= &arg.start {
+            if range.start() < &arg.end && range.end() >= &arg.start || (range.start() == &0 && range.end() == &0) {
                 let mut buf = [0u8; PAGE_SIZE as usize];
                 file.read_exact_at(&mut buf, *offset)?;
                 let page: IndexPage = index_page_from_b(buf);
+                loginfo!("\npage({:?}): {:?}\n",range,page);
                 
                 // Search within the page elements
                 for (key, value) in &page.elements {
@@ -264,14 +273,14 @@ impl Search<RangeInclusive<u64>> for Indexing {
         let mut results = BTreeSet::new();
         let metadata = self.metadata.lock().await;
         let file = self.file.lock().await;
-        
+        loginfo!("\nmetadata: {:?}\n",metadata);
         for (_page_idx, (range, offset)) in metadata.iter().enumerate() {
             // Check if page range overlaps with search range
-            if range.start() <= arg.end() && range.end() >= arg.start() {
+            if range.start() <= arg.end() && range.end() >= arg.start() || range.start() == &0 && range.end() == &0 {
                 let mut buf = [0u8; PAGE_SIZE as usize];
                 file.read_exact_at(&mut buf, *offset)?;
                 let page: IndexPage = index_page_from_b(buf);
-                
+                loginfo!("\npage({:?}): {:?}\n",range,page);
                 // Search within the page elements
                 for (key, value) in &page.elements {
                     if arg.contains(key) {
@@ -353,9 +362,7 @@ impl IndexHashing for i8{
 
 impl IndexHashing for u128{
     fn index_hash(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish()
+        *self as u64
     }
 }
 
@@ -427,19 +434,19 @@ impl GetIndex for u128{
 
 impl GetIndex for u64{
     fn get_index(&self) -> u64{
-        self.index_hash()
+        *self
     }
 }
 
 impl GetIndex for u32{
     fn get_index(&self) -> u64{
-        self.index_hash()
+        *self as u64
     }
 }
 
 impl GetIndex for u16{
     fn get_index(&self) -> u64{
-        self.index_hash()
+        *self as u64
     }
 }
 
@@ -451,7 +458,7 @@ impl GetIndex for u8{
 
 impl GetIndex for f64{
     fn get_index(&self) -> u64{
-        self.index_hash()
+        *self as u64
     }
 }
 

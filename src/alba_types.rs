@@ -3,7 +3,7 @@ use std::{fmt, io::{Error, ErrorKind}};
 use base64::{engine::general_purpose, Engine};
 use serde::{Deserialize, Serialize};
 
-use crate::{database::MAX_STR_LEN, lexer_functions::Token};
+use crate::{database::MAX_STR_LEN, Token};
 
 #[derive( Clone, PartialEq, Deserialize, Serialize)]
 pub enum AlbaTypes{

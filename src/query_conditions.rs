@@ -4,7 +4,7 @@ use aes_gcm::aead::consts::U9223372036854775808;
 use ahash::AHashMap;
 use regex::{Regex, Replacer};
 
-use crate::{alba_types::AlbaTypes, gerr, indexing::GetIndex, lexer_functions::Token, loginfo, query::PrimitiveQueryConditions, row::Row};
+use crate::{alba_types::AlbaTypes, gerr, indexing::GetIndex, Token, loginfo, query::PrimitiveQueryConditions, row::Row};
 
 
 fn string_to_char(s: String) -> Result<char, io::Error> {

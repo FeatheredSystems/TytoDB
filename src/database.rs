@@ -1,69 +1,40 @@
-use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, pin::Pin, str::FromStr, sync::Arc};
 use ahash::AHashMap;
 use base64::{alphabet, engine::{self, GeneralPurpose}, Engine};
+use futures::future::UnwrapOrElse;
 use lazy_static::lazy_static;
 use serde::{Serialize,Deserialize};
 use serde_yaml;
-use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, parser::{debug_tokens, parse}, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, AlbaContainer, AST};
-use rand::{Rng, distributions::Alphanumeric};
-use tokio::{net::TcpListener, sync::Mutex};
+use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, AlbaContainer, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
+use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
+use tokio::sync::Mutex;
 /////////////////////////////////////////////////
 /////////     DEFAULT_SETTINGS    ///////////////
 /////////////////////////////////////////////////
 
 pub const MAX_STR_LEN : usize = 128;
 const DEFAULT_SETTINGS : &str = r#"
-max_columns: 50
+max_columns: 125
 min_columns: 1
-auto_commit: false            
-memory_limit: 1048576000
-ip: 127.0.0.1
-connections_port: 1515
-data_port: 5000
-max_connections: 10
-max_connection_requests_per_minute: 10
-max_data_requests_per_minute: 10000000
-on_insecure_rejection_delay_ms: 100
-safety_level: strict # strict | permissive
-request_handling: sync # sync | asynchronous
-secret_key_count: 10
+memory_limit: 4096
+auto_commit: false
+ip: "127.0.0.1"
+port: 4287
+workers: 1
 "#;
-#[derive(Serialize, Deserialize, Debug, Default)]
-enum SafetyLevel {
-    #[default]
-    #[serde(rename="strict")]
-    Strict,
-    #[serde(rename="permissive")]
-    Permissive,
-}
 
-#[derive(Serialize, Deserialize, Debug, Default)]
-enum RequestHandling {
-    #[default]
-    #[serde(rename="sync")]
-    Sync,
-    #[serde(rename="asynchronous")]
-    Asynchronous,
-}
 #[derive(Serialize,Deserialize, Default,Debug)]
 struct Settings{
     max_columns : u32,
     min_columns : u32,
-    memory_limit : u64,
+    memory_limit : u32,
     auto_commit : bool,
     ip:String,
-    connections_port: u32,
-    data_port: u32,
-    max_connections: u32,
-    max_connection_requests_per_minute: u32,
-    max_data_requests_per_minute: u32,
-    on_insecure_rejection_delay_ms: u64,
-    safety_level: SafetyLevel,
-    request_handling: RequestHandling,
-    secret_key_count: u64
+    port: u32,
+    workers: u32
 }
 
-const SECRET_KEY_PATH : &str = "TytoDB/.tytodb-keys";
+const SECRET_KEY_PATH : &str = "TytoDB/.secret";
 pub const DATABASE_PATH : &str = "TytoDB";
 
 pub fn database_path() -> String{
@@ -101,7 +72,6 @@ pub struct Database{
     containers : Vec<String>,
     headers : Vec<(Vec<String>,Vec<AlbaTypes>)>,
     pub container : HashMap<String,Arc<Mutex<Container>>>,
-    secret_keys : Arc<Mutex<HashMap<[u8;32],Vec<u8>>>>,
 }
 
 fn check_for_reference_folder(location : &String) -> Result<(), Error>{
@@ -480,14 +450,14 @@ impl Database{
                 let mut query : Option<Query> = None;
                 for i in structure.container{
                     
-                    if let AlbaContainer::Virtual(virt) = i{
-                        let ast = debug_tokens(&virt)?;
-                        let result_query = Box::pin(self.run(ast)).await?;
-                        if let Some(ref mut q) = query{
-                            q.join(result_query);
-                        }else{
-                            query = Some(result_query)
-                        }
+                    if let AlbaContainer::Virtual(i) = i{
+                        let result_query = Box::pin(self.run(AST::Search(i))).await?;
+                            if let Some(ref mut q) = query{
+                                q.join(result_query);
+                            }else{
+                                query = Some(result_query)
+                            }
+                        
                         continue;
                     }
                     
@@ -848,11 +818,11 @@ impl Database{
         Ok(Query::new_none(Vec::new()))
     }
     
-    pub async fn execute(&mut self, input: &str, arguments: Vec<String>) -> Result<Query, Error> {
-        let ast = parse(input.to_owned(), arguments)?;
-        let result = self.run(ast).await?;
-        Ok(result)
-    }
+    // pub async fn execute(&mut self, input: &str, arguments: Vec<String>) -> Result<Query, Error> {
+    //     let ast = parse(input.to_owned(), arguments)?;
+    //     let result = self.run(ast).await?;
+    //     Ok(result)
+    // }
 }
 
 pub async fn connect() -> Result<Database, Error>{
@@ -879,7 +849,7 @@ pub async fn connect() -> Result<Database, Error>{
     //     start_strix(strix.clone()).await;
     // }
 
-    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new(),secret_keys:Arc::new(Mutex::new(HashMap::new()))};
+    let mut db = Database{location:database_path().to_string(),settings:Default::default(),containers:Vec::new(),headers:Vec::new(),container:HashMap::new()};
     db.setup().await?;
     if let Err(e) = db.load_settings(){
         logerr!("err: load_settings");
@@ -893,321 +863,138 @@ pub async fn connect() -> Result<Database, Error>{
 }
 
 
-async fn handle_connections_tcp_inner(payload : Vec<u8>,dbref: Arc<Mutex<Database>>) -> Vec<u8>{
-    let mut secret_key_hash : [u8;32] = [0u8;32];
-    secret_key_hash.clone_from_slice(payload.as_slice());
+use tytodb_conn::{commands::{AlbaContainer as NetworkAlbaContainer, Commands as commands, Compile, CreateContainer}, db_response::DBResponse, logical_operators::LogicalOperator};
+use tytodb_conn::types::AlbaTypes as NetworkAlbaTypes;
 
-    let secret_key = match dbref.lock().await.secret_keys.lock().await.get(&secret_key_hash){
-        Some(a) => a.clone(),
-        None => {
-            let buffer : [u8;1] = [false as u8];
-            logerr!("the given secret key are not registred");
-            return buffer.to_vec()
-        }
-    };
-
-    let mut buffer : Vec<u8> = Vec::new();
-    let session_id = secret_key.clone();
-    let hash = blake3::hash(&session_id).as_bytes().clone();
-    let key = Key::<Aes256Gcm>::from_slice(secret_key.as_slice());
-    let _ = session_secret_rel.lock().await.insert(hash.clone(), session_id.clone());
-    cipher_map.lock().await.insert(hash.clone(),Aes256Gcm::new(key));
-
-    if let Ok(a) = encrypt(&session_id, &secret_key_hash).await{
-        buffer.push(true as u8);
-        buffer.extend_from_slice(&a);
-    }else{
-        buffer.push(false as u8);
-    }
-    
-
-    //
-    buffer
-    // let _ = socket.shutdown().await;
-
-}
-
-// async fn handle_connections_tcp_sync(listener : &TcpListener,ardb : Arc<Mutex<Database>>){
-//     let (mut socket, addr) = match listener.accept().await{
-//         Ok(a) => a,
-//         Err(e) => {
-//             logerr!("{}",e);
-//             return
-//         }
-//     };
-//     //
-//     //handle_connections_tcp_inner(&mut socket, ardb).await;
-//     // if let Err(e) = socket.shutdown().await{
-//     //     logerr!("{}",e);
-//     // }
-// }
-// async fn handle_connections_tcp_parallel(listener : &TcpListener,ardb : Arc<Mutex<Database>>){
-//     let (mut socket, addr) = match listener.accept().await{
-//         Ok(a) => a,
-//         Err(e) => {
-//             logerr!("{}",e);
-//             return
-//         }
-//     };
-//     //
-//     tokio::task::spawn(async move {
-//         handle_connections_tcp_inner(&mut socket, ardb).await;
-//     });
-    
-//     // if let Err(e) = socket.shutdown().await{
-//     //     logerr!("{}",e);
-//     // }
-// }
-
-
-use aes_gcm::{aead::{Aead, KeyInit, OsRng}, aes::cipher::{self}, AeadCore, Key};
-use aes_gcm::Aes256Gcm;
-
-lazy_static!{
-    static ref cipher_map : Arc<Mutex<AHashMap<[u8;32],aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>>>>> = Arc::new(Mutex::new(AHashMap::new()));
-    static ref session_secret_rel : Arc<Mutex<AHashMap<[u8;32],Vec<u8>>>> = Arc::new(Mutex::new(AHashMap::new())); 
-}
-
-async fn encrypt(content : &[u8],secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
-    let cm = cipher_map.lock().await;
-    let cipher: &aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>> = 
-    if let Some(a) = cm.get(secret_key){
-        a
-    } else{
-        return Err(())
-    };
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng); 
-    let mut result : Vec<u8> = Vec::new();
-    //
-    result.extend_from_slice(&nonce.to_vec());
-    result.extend_from_slice(&cipher.encrypt(&nonce, content.as_ref()).unwrap());
-    Ok(result)
-}
-async fn decrypt(cipher_text : &[u8],secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
-    let nonce = &cipher_text[0..12];
-    let cipher_b = &cipher_text[12..];
-    let cm = cipher_map.lock().await;
-    let cipher: &aes_gcm::AesGcm<aes_gcm::aes::Aes256, cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UInt<cipher::typenum::UTerm, cipher::consts::B1>, cipher::consts::B1>, cipher::consts::B0>, cipher::consts::B0>> = 
-    if let Some(a) = cm.get(secret_key){
-        a
-    } else{
-        return Err(())
-    };
-    match cipher.decrypt(nonce.into(), cipher_b.as_ref()){
-        Ok(a) => Ok(a),
-        Err(e) => {
-            logerr!("{}",e);
-            Err(())
-        }
+fn ab_from_nat(a : NetworkAlbaTypes) -> AlbaTypes{
+    match a{
+        NetworkAlbaTypes::String(a) => AlbaTypes::LargeString(a),
+        NetworkAlbaTypes::U8(a) => AlbaTypes::Int(a as i32),
+        NetworkAlbaTypes::U16(a) => AlbaTypes::Int(a as i32),
+        NetworkAlbaTypes::U32(a) => AlbaTypes::Bigint(a as i64),
+        NetworkAlbaTypes::U64(a) => AlbaTypes::Bigint(a as i64),
+        NetworkAlbaTypes::U128(a) => AlbaTypes::Bigint(a as i64),
+        NetworkAlbaTypes::F32(a) => AlbaTypes::Float(a as f64),
+        NetworkAlbaTypes::F64(a) => AlbaTypes::Float(a as f64),
+        NetworkAlbaTypes::Bool(a) => AlbaTypes::Bool(a as bool),
+        NetworkAlbaTypes::I32(a) => AlbaTypes::Int(a as i32),
+        NetworkAlbaTypes::I64(a) => AlbaTypes::Bigint(a as i64),
+        NetworkAlbaTypes::Bytes(items) => AlbaTypes::LargeBytes(items),
     }
 }
 
 
-#[derive(Deserialize)]
-struct DataConnection{
-    command : String,
-    arguments : Vec<String>
-}
-
-#[derive(Serialize)]
-struct QueryResponse{
-    rows : Vec<Vec<AlbaTypes>>
-}
-
-#[derive(Serialize,Default)]
-struct TytoDBResponse{
-    #[serde(rename = "?")]
-    content : String,
-    #[serde(rename = "!")]
-    success : u8
-}
-
-impl TytoDBResponse {
-    async fn to_bytes(self,secret_key : &[u8;32]) -> Result<Vec<u8>,()>{
-        let bytes = serde_json::to_vec(&self).unwrap();
-        return if let Ok(a) = encrypt(&bytes, secret_key).await{
-            Ok(a)
-        }else{
-            Err(())
-        };
-    }
-}
-
-
-async fn handle_data_tcp_inner(dbref: Arc<Mutex<Database>>,rc_payload:Vec<u8>) -> Vec<u8>{
-    let size = rc_payload.len();
-    if size <= 0{
-        logerr!("the payload is too short | size :{}",size);
-        return (0 as u64).to_be_bytes().as_slice().to_vec()
-    }
-    //
-    let mut session_id : [u8;32] = [0u8;32];
-    session_id.clone_from_slice(&rc_payload[..32]);
-    //
-
-
-    let ssr = session_secret_rel.lock().await;
-    let mut db = dbref.lock().await;
-    let mut payload: Vec<u8> = Vec::with_capacity(512);
-    payload.extend_from_slice(&rc_payload[32..]);
-    if let Some(_) = ssr.get(&session_id) {
-        //
-        
-        
-        payload = match decrypt(&payload, &session_id).await{
-            Ok(a) => a,
-            Err(_) => {
-                return (0 as u64).to_be_bytes().as_slice().to_vec()
-            }
-        };
-        //
-        
-                 
-    } else {
-        logerr!("No session secret found for session_id");
-        payload.clear();
-        return (0 as u64).to_be_bytes().as_slice().to_vec();
-    }
-    //
-    let mut response: Vec<u8> = Vec::with_capacity(510);
-    match serde_json::from_slice::<DataConnection>(&payload) {
-        Ok(v) => {
-            //
-            match db.execute(&v.command,v.arguments).await {
-                Ok(query_result) => {
-                    //
-                    //
-                    let l = query_result.rows.1.len();
-                    let mut qr = QueryResponse{
-                        rows : Vec::with_capacity(l)
-                    };
-                    for i in query_result.rows.1{
-                        qr.rows.push(i)
-                    }
-                    match serde_json::to_string(&qr) {
-                        
-                        Ok(q) => {
-                            //
-                            if let Ok(b) = (TytoDBResponse{
-                                content:q,
-                                success:1
-                            }).to_bytes(&session_id).await{
-                                let size = b.len() as u64;
-                                response.extend_from_slice(&size.to_be_bytes());
-                                response.extend_from_slice(&b);
-                            }else{
-                                let size = 0 as u64;
-                                response.extend_from_slice(&size.to_be_bytes());
-                            };
-                            //
-                            
-                        }
-                        Err(e) => {
-                            logerr!("Failed to serialize query result: {}", e);
-                            if let Ok(b) = (TytoDBResponse{
-                                content:format!("Failed to serialize query result: {}", e),
-                                success:0
-                            }.to_bytes(&session_id).await){
-                                let size = b.len() as u64;
-                                response.extend_from_slice(&size.to_be_bytes());
-                                response.extend_from_slice(&b);
-                            }else{
-                                let size = 0 as u64;
-                                response.extend_from_slice(&size.to_be_bytes());
-                            }
-                            
-                        }
-                    }
+impl Query {
+    fn to_row_list(&self) -> Vec<tytodb_conn::db_response::Row> {
+        let mut a: Vec<tytodb_conn::db_response::Row> = Vec::new();
+        for i in self.rows.1.iter() {
+            let row_data: Vec<NetworkAlbaTypes> = i.iter().map(|a| {
+                match a {
+                    AlbaTypes::Text(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::Int(i) => NetworkAlbaTypes::I32(*i),
+                    AlbaTypes::Bigint(i) => NetworkAlbaTypes::I64(*i),
+                    AlbaTypes::Float(f) => NetworkAlbaTypes::F64(*f),
+                    AlbaTypes::Bool(b) => NetworkAlbaTypes::Bool(*b),
+                    AlbaTypes::Char(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::NanoString(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::SmallString(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::MediumString(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::BigString(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::LargeString(s) => NetworkAlbaTypes::String(s.to_string()),
+                    AlbaTypes::NanoBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
+                    AlbaTypes::SmallBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
+                    AlbaTypes::MediumBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
+                    AlbaTypes::BigSBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
+                    AlbaTypes::LargeBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
+                    AlbaTypes::NONE => NetworkAlbaTypes::U8(0),
                 }
-                Err(e) => {
-                    logerr!("Failed to execute command '{}': {}", v.command, e);
-                    if let Ok(b) = (TytoDBResponse{
-                        content:format!("Failed to execute command '{}': {}", v.command, e),
-                        success:0
-                    }.to_bytes(&session_id).await){
-                        let size = b.len() as u64;
-                        response.extend_from_slice(&size.to_be_bytes());
-                        response.extend_from_slice(&b);
-                        //
-                    }else{
-                        if let Ok(b) = (TytoDBResponse{
-                            content:e.to_string(),
-                            success:1
-                        }).to_bytes(&session_id).await{
-                            let size = b.len() as u64;
-                            response.extend_from_slice(&size.to_be_bytes());
-                            response.extend_from_slice(&b);
-                        }else{
-                            let size = 0 as u64;
-                            response.extend_from_slice(&size.to_be_bytes());
-                        };
-                    }
-                }
-            }
+            }).collect();
+            
+            a.push(tytodb_conn::db_response::Row::new(row_data)); // or however Row is constructed
         }
-        Err(e) => {
-            if let Ok(b) = (TytoDBResponse{
-                content:format!("Failed to deserialize payload '{}'", e),
-                success:0
-            }.to_bytes(&session_id).await){
-                let size = b.len() as u64;
-                response.extend_from_slice(&size.to_be_bytes());
-                response.extend_from_slice(&b)
-            }else{
-                let size = 0 as u64;
-                response.extend_from_slice(&size.to_be_bytes());
-            }
-        }
+        a
     }
-    //
-    if response.len() < 1{
-        logerr!("empty response");
-        return (0 as u64).to_be_bytes().as_slice().to_vec()
-    }
-    //
-    return response;
 }
 
 
-use std::convert::Infallible;
-use std::net::SocketAddr;
-
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Bytes, Method, StatusCode};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
-
-async fn handle_data(req: Request<hyper::body::Incoming>,dbref: Arc<Mutex<Database>>) -> Result<Response<Full<Bytes>>, Infallible> {
-    let method = req.method().to_owned();
-    let frame_stream = match req.collect().await{
-        Ok(v)=> {v.to_bytes().to_vec()},
-        Err(e) => {
-            logerr!("{}",e);
-            let r = Response::builder().status(StatusCode::BAD_REQUEST).body(Full::from(Bytes::from("Invalid input"))).unwrap();
-            return Ok(r)
-        }
-    };
-    if method == Method::POST{
-        return Ok(Response::new(Full::new(Bytes::from(handle_data_tcp_inner(dbref, frame_stream).await))))
-    }else{
-        Ok(Response::new(Full::new(Bytes::from(handle_connections_tcp_inner(frame_stream, dbref).await))))
+fn row_list_to_bytes(a : Vec<tytodb_conn::db_response::Row>) -> Vec<u8>{
+    let mut b = Vec::new(); 
+    for i in a{
+        b.extend_from_slice(&i.encode());
     }
-
+    b
 }
+
+fn boop(q : Query) -> Vec<u8>{
+    let mut byte = vec![0u8];
+    byte.extend_from_slice(&row_list_to_bytes(q.to_row_list()));
+    return byte
+}
+fn alba_types_to_token(alba_type: AlbaTypes) -> Token {
+    match alba_type {
+        AlbaTypes::Text(s) => Token::String(s),
+        AlbaTypes::Int(i) => Token::Int(i as i64),
+        AlbaTypes::Bigint(i) => Token::Int(i),
+        AlbaTypes::Float(f) => Token::Float(f),
+        AlbaTypes::Bool(b) => Token::Bool(b),
+        AlbaTypes::Char(s) => Token::String(s.to_string()),
+        AlbaTypes::NanoString(s) => Token::String(s),
+        AlbaTypes::SmallString(s) => Token::String(s),
+        AlbaTypes::MediumString(s) => Token::String(s),
+        AlbaTypes::BigString(s) => Token::String(s),
+        AlbaTypes::LargeString(s) => Token::String(s),
+        AlbaTypes::NanoBytes(items) => Token::Bytes(items),
+        AlbaTypes::SmallBytes(items) => Token::Bytes(items),
+        AlbaTypes::MediumBytes(items) => Token::Bytes(items),
+        AlbaTypes::BigSBytes(items) => Token::Bytes(items),
+        AlbaTypes::LargeBytes(items) => Token::Bytes(items),
+        AlbaTypes::NONE => Token::Int(0),
+    }
+}
+fn conditions_to_tyto_db(t: (Vec<(String, LogicalOperator, NetworkAlbaTypes)>, Vec<(usize, char)>)) -> (Vec<(Token, Token, Token)>, Vec<(usize, char)>) {
+    (t.0.iter().map(|f| {
+        (
+            Token::String(f.0.clone()),
+            Token::Operator(match f.1 {
+                LogicalOperator::Equal => "=".to_string(),
+                LogicalOperator::Diferent => "!=".to_string(),
+                LogicalOperator::Higher => ">".to_string(),
+                LogicalOperator::Lower => "<".to_string(),
+                LogicalOperator::HigherEquality => ">=".to_string(),
+                LogicalOperator::LowerEquality => "<=".to_string(),
+                LogicalOperator::StringContains => "&>".to_string(),
+                LogicalOperator::StringContainsInsensitive => "&&>".to_string(),
+                LogicalOperator::StringRegex => "&&&>".to_string(),
+            }),
+            (alba_types_to_token(ab_from_nat(f.2.clone()))) // Convert AlbaTypes to Token
+        )
+    }).collect(), t.1)
+}
+
+fn build_ast_search_from_search(search : tytodb_conn::commands::Search) -> AstSearch{
+    AstSearch{            
+        col_nam: search.col_nam,
+        container: {
+            let mut a = Vec::new();
+            for f in search.container{
+                a.push(match f {
+                    NetworkAlbaContainer::Real(a) => AlbaContainer::Real(a),
+                    NetworkAlbaContainer::Virtual(searchs) => AlbaContainer::Virtual(build_ast_search_from_search(searchs)),
+                });
+            }
+            a
+        },
+        conditions: conditions_to_tyto_db(search.conditions)
+    }
+}
+use falcotcp::Server;
 impl Database{
     pub async fn run_database(self) -> Result<(), Error>{
-        let crazy_config = engine::GeneralPurposeConfig::new()
-        .with_decode_allow_trailing_bits(true)
-        .with_encode_padding(true)
-        .with_decode_padding_mode(engine::DecodePaddingMode::Indifferent);
-        let eng = base64::engine::GeneralPurpose::new(&alphabet::Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/").unwrap(), crazy_config);
-
+        let mut password : [u8;32] = [0u8;32];
         if fs::exists(secret_key_path()).unwrap(){
             let mut buffer : Vec<u8> = Vec::new();
             fs::File::open(secret_key_path()).unwrap().read_to_end(&mut buffer)?;
-            let val = match serde_yaml::from_slice::<Vec<String>>(&buffer){Ok(a)=>a,Err(e)=>{return Err(gerr(&e.to_string()))}};
+            password[0..].copy_from_slice(&buffer);
             // let bv : Vec<Vec<u8>> = val.iter().map(|s|{
             //     match eng.decode(s){
             //         Ok(a)=>a,
@@ -1216,75 +1003,184 @@ impl Database{
             //         }
             //     }
             // }).collect();
-            let mut bv : Vec<Vec<u8>> = Vec::new();
-            for i in val{
-                match eng.decode(i) {
-                    Ok(a)=>{bv.push(a);},
-                    Err(e)=>{
-                        return Err(gerr(&e.to_string()))
-                    }
-                };
-            }
-
-            let mut sk = self.secret_keys.lock().await;
-            for i in bv{
-                sk.insert(blake3::hash(&i).as_bytes().to_owned(), i);
-            }
         }else{
             let mut file = fs::File::create_new(secret_key_path()).unwrap();
-            let mut keys : Vec<Vec<u8>> = Vec::new();
-            for _ in 0..self.settings.secret_key_count{
-                keys.push(Aes256Gcm::generate_key(OsRng).to_vec());
-            }
-            let mut sk = self.secret_keys.lock().await;
-            for i in keys.iter(){
-                sk.insert(blake3::hash(&i).as_bytes().to_owned(), i.clone());
-            }
+            let mut bytes: [u8; 32] = [0u8;32];
+            let mut osr = OsRng;
+            for i in 0..4usize{
+                let b : [u8;8] = OsRng::next_u64(&mut osr).to_le_bytes();
+                bytes[i*8..(i+1)*8].copy_from_slice(&b);
 
-            let mut b64_list : Vec<String> = Vec::new();
-            for i in keys{
-                b64_list.push(eng.encode(i))
             }
-            if let Err(e) = serde_yaml::to_writer(&mut file, &b64_list){
-                logerr!("{}",e);
-                return Err(gerr(&e.to_string()))
-            };
+            let _ = file.write_all(&bytes);
             file.flush()?;
             file.sync_all()?;
+            password = bytes;
         }
-        let settings = &self.settings;
-        //let connection_tcp_url = format!("{}:{}",settings.ip,settings.connections_port);
-        let data_tcp_url = format!("{}:{}",settings.ip,settings.data_port);
-        //
-        //
-        
-        let mtx_db = Arc::new(Mutex::new(self));
-        // loop {
-            
-        //     handle_connections_tcp_sync(&connections_tcp,mtx_db.clone()).await;
-        //     handle_data_tcp(&rrr,mtx_db.clone()).await;
-        // }
+        let host = format!("{}:{}",self.settings.ip.clone(),self.settings.port.clone());
+        let workers = self.settings.workers.clone() as usize;
+        let mtx_db: &'static Arc<Mutex<Database>> = Box::leak(Box::new(Arc::new(Mutex::new(self))));
 
-        let addr = SocketAddr::from_str(&data_tcp_url).unwrap();
-        let listener = TcpListener::bind(addr).await?;
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let io = TokioIo::new(stream);
-            let c = mtx_db.clone();
-            tokio::task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| {
-                        let b = c.to_owned();
-                        async move {
-                            handle_data(req, b).await
-                        }
-                    }))
-                    .await
-                {
-                    logerr!("Error serving connection: {:?}", err);
+
+        let message_handler: Arc<(dyn Fn(Vec<u8>) -> Pin<Box<(dyn futures::Future<Output = Vec<u8>> + std::marker::Send + 'static)>> + std::marker::Send + Sync + 'static)> = Arc::new(move |input: Vec<u8>| { Box::pin(async move {
+            println!("bytes tytodb received: {:?}",input);
+            match commands::decompile(&match zstd::bulk::decompress(&input,input.len()){
+                Ok(a) => a,
+                Err(e) => {
+                    let mut b = vec![1u8];
+                    b.extend_from_slice(&e.to_string().as_bytes());
+                    return b
                 }
-            });
-        }
-
+            }){
+                Ok(a) => {
+                    match a{
+                        commands::CreateContainer(create_container) => {
+                            let mut col_v = Vec::new();
+                            for f in create_container.col_val{
+                                match AlbaTypes::from_id(f){
+                                    Ok(a) => {
+                                        col_v.push(a);
+                                    },
+                                    Err(e) => {
+                                        let mut b = vec![1u8];
+                                        b.extend_from_slice(&e.to_string().as_bytes());
+                                        return b
+                                    }
+                                }
+                            }
+                            let mut db = mtx_db.lock().await;
+                            let c =  db.run(AST::CreateContainer(crate::AstCreateContainer {
+                                name: create_container.name,
+                                col_nam: create_container.col_nam,
+                                col_val: col_v
+                            })).await;
+                            match c {
+                                Ok(q) => {
+                                    return boop(q)
+                                }
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::CreateRow(create_row) => {
+                            match mtx_db.lock().await.run(AST::CreateRow(AstCreateRow{
+                                col_nam: create_row.col_nam,
+                                col_val: create_row.col_val.iter().map(|f|{ab_from_nat(f.clone())}).collect(),
+                                container: create_row.container
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::EditRow(edit_row) => {
+                            match mtx_db.lock().await.run(AST::EditRow(AstEditRow{
+                                col_nam: edit_row.col_nam,
+                                col_val: edit_row.col_val.iter().map(|f|{ab_from_nat(f.clone())}).collect(),
+                                container: edit_row.container,
+                                conditions: conditions_to_tyto_db(edit_row.conditions)
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::DeleteRow(delete_row) => {
+                            match mtx_db.lock().await.run(AST::DeleteRow(AstDeleteRow{
+                                container: delete_row.container,
+                                conditions: if let Some(s) = delete_row.conditions{Some(conditions_to_tyto_db(s))}else{None}
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::DeleteContainer(delete_container) => {
+                            match mtx_db.lock().await.run(AST::DeleteContainer(AstDeleteContainer{
+                                container: delete_container.container,
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::Search(search) => {
+                            let mtx_db = &mtx_db;
+                            async fn a(search: tytodb_conn::commands::Search,mtx_db: &'static Arc<Mutex<Database>>) -> Vec<u8>{
+                                match mtx_db.lock().await.run(AST::Search(AstSearch{
+                                
+                                    col_nam: search.col_nam,
+                                    container: {
+                                        let mut a = Vec::new();
+                                        for f in search.container{
+                                            a.push(match f {
+                                                NetworkAlbaContainer::Real(a) => AlbaContainer::Real(a),
+                                                NetworkAlbaContainer::Virtual(searchs) => AlbaContainer::Virtual(build_ast_search_from_search(searchs)),
+                                            })
+                                        }
+                                        a
+                                    },
+                                    conditions: conditions_to_tyto_db(search.conditions)
+                                })).await{
+                                    Ok(a) => {boop(a)},
+                                    Err(e) => {
+                                        let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                        b.extend_from_slice(&e.to_string().as_bytes());
+                                        return b
+                                    }
+                                }
+                            }
+                            a(search,&mtx_db).await
+                        },
+                        commands::Commit(commit) => {
+                            match mtx_db.lock().await.run(AST::Commit(AstCommit{
+                                container: commit.container
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                        commands::Rollback(rollback) => {
+                            match mtx_db.lock().await.run(AST::Rollback(AstRollback{
+                                container: rollback.container,
+                            })).await{
+                                Ok(a) => return boop(a),
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
+                                }
+                            }
+                        },
+                    }
+                },
+                Err(e) => {
+                    let mut b = vec![1u8];
+                    b.extend_from_slice(e.to_string().as_bytes());
+                    return b
+                }
+            };
+            return vec![1u8,115, 111, 109, 101, 116, 104, 105, 110, 103, 32, 117, 110, 101, 120, 112, 101, 99, 116, 101,100, 32, 104, 97, 112, 112, 101, 110, 101, 100]
+        })});
+        Server::new(host, password, message_handler, workers).await
     }
 }

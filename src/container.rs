@@ -1,9 +1,8 @@
 
-use std::{collections::{BTreeSet, HashMap}, ffi::CString, io::{self, Error, ErrorKind, Write}, mem::discriminant, os::unix::fs::FileExt, sync::Arc};
+use std::{collections::{BTreeSet, HashMap}, io::{Error, ErrorKind}, os::fd::AsRawFd, sync::Arc};
 use ahash::AHashMap;
-use tokio::{io::AsyncReadExt, sync::Mutex};
-use tokio::fs::{File,self};
-use crate::{alba_types::AlbaTypes, database::write_data, gerr, indexing::{Add, GetIndex, Indexing, Remove}, logerr, loginfo};
+use tokio::sync::Mutex;
+use crate::{alba_types::AlbaTypes, database::{batch_write_data, WriteEntry}, gerr};
 
 
 type MvccType = Arc<Mutex<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
@@ -15,9 +14,7 @@ pub struct Container{
     pub str_size : usize,
     pub mvcc : MvccType,
     pub headers_offset : u64,
-    pub location : String,
-    pub graveyard : Arc<Mutex<BTreeSet<u64>>>,
-    pub indexing : Arc<Indexing>
+    pub graveyard : Arc<Mutex<BTreeSet<u64>>>
 
 }
 fn serialize_closed_string(item : &AlbaTypes,s : &String,buffer : &mut Vec<u8>){
@@ -42,7 +39,7 @@ fn serialize_closed_blob(item : &AlbaTypes,blob : &mut Vec<u8>,buffer : &mut Vec
 
 
 impl Container {
-    pub async fn new(container_name : String,path : &str,location : String,element_size : usize, columns : Vec<AlbaTypes>,str_size : usize,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
+    pub async fn new(path : &str,element_size : usize, columns : Vec<AlbaTypes>,str_size : usize,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
         let mut  headers = Vec::new();
         for index in 0..((columns.len()+column_names.len())/2){
             let name = match column_names.get(index){
@@ -77,9 +74,7 @@ impl Container {
             mvcc: Arc::new(Mutex::new((AHashMap::new(),HashMap::new()))),
             headers_offset: headers_offset.clone() ,
             headers,
-            location,
-            graveyard: Arc::new(Mutex::new(BTreeSet::new())),
-            indexing:Indexing::load_index(&container_name).await.unwrap()
+            graveyard: Arc::new(Mutex::new(BTreeSet::new()))
         }));
         Ok(container)
     }
@@ -91,13 +86,6 @@ impl Container{
     }
 }
 
-async fn try_open_file(path: &str) -> io::Result<Option<File>> {
-    match File::open(path).await {
-        Ok(file) => Ok(Some(file)),
-        Err(ref e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
 fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values: &mut Vec<AlbaTypes>) -> Result<(), Error> {
     let bytes = &buf[*index..*index+instance_size];
     let mut size : [u8;8] = [0u8;8];
@@ -202,16 +190,6 @@ impl Container{
         };
         Ok(file_rows.max(mvcc_max))
     }
-    pub async fn arrlen_abs(&self) -> Result<u64, Error> {
-        let file_len = self.len().await?;
-        let file_rows = if file_len > self.headers_offset {
-            (file_len - self.headers_offset) / self.element_size as u64
-        } else {
-            0
-        };
-        println!("header_offset: {:?}",self.headers_offset);
-        Ok(file_rows)
-    }
     // pub fn get_alba_type_from_column_name(&self,column_name : &String) -> Option<AlbaTypes>{
     //     for i in self.headers.iter(){
     //         if *i.0 == *column_name{
@@ -270,70 +248,48 @@ impl Container{
         insertions.sort_by_key(|(index, _)| *index);
         deletes.sort_by_key(|(index, _)| *index);
         let buf = vec![0u8; self.element_size];
-        let fi = self.file.lock().await;
+
+        let mut writting : Vec<(u64,Vec<u8>)> = Vec::with_capacity(insertions.len());
+
         for (row_index, row_data) in insertions {
             let serialized = self.serialize_row(&row_data)?;
             let offset = row_index;
-            if let Some(arg) = row_data.first(){
-                let i = self.indexing.clone();
-                let j = offset.clone();
-                let idx = arg.get_index();
-                i.add(idx, j).await.unwrap();
-            }
-            
-            fi.write_all_at(serialized.as_slice(), offset).unwrap();
-            //virtual_ward.insert(offset as usize, (const_xxh3::xxh3_64(serialized.as_slice()),serialized));
+            writting.push((offset,serialized));
         }
-        
+
+
         let mut graveyard = self.graveyard.lock().await;
-        
+
         for del in &deletes {
             let offset = del.0;
             let row_index = (offset - self.headers_offset) / self.element_size as u64;
-            fi.write_all_at(&buf, offset).unwrap();
-            graveyard.insert(row_index);  // Store row index
-            if let Some(arg) = del.1.first(){
-                let i = self.indexing.clone();
-                let j = offset.clone();
-                let idx = arg.get_index();
-                i.remove(idx, j).await.unwrap();
-            }
-            loginfo!("offset: {}",offset);
-            loginfo!("row_index: {}",row_index);
-            
+            writting.push((offset,buf.clone()));
+            graveyard.insert(row_index);  
         }
         
-
-        for (i, txt) in  mvcc.1.iter(){
-            let path = format!("{}/rf/{}", self.location, i); 
-            if !txt.0 {
-                let mut file: std::fs::File = std::fs::File::create_new(&path)?;
-                if let Err(e) = file.write_all(txt.1.as_bytes()){
-                    return Err(gerr(&format!("Failed to write in text file: {}",e)))
-                };
-                
-                let buffer = txt.1.as_bytes();
-                let c_path = match CString::new(path).map_err(|e| e.to_string()){Ok(a) => a, Err(e) => return Err(gerr(&e))};
-                    let result = unsafe {
-                        write_data(buffer.as_ptr(), buffer.len(), c_path.as_ptr())
-                    };
-
-                    if result != 1 {
-                        logerr!("C write_data failed")
-                    }
-            } else if std::fs::exists(&path)?{
-                fs::remove_file(&path).await?
-            }
-        
-        }
-
         mvcc.1.clear();
         mvcc.1.shrink_to_fit();
         // if let Some(s) = STRIX.get(){
         //     let mut l = s.lock().await;
         //     l.wards.push(Mutex::new((std::fs::OpenOptions::new().read(true).write(true).open(&self.file_path)?,virtual_ward)));
         // }
-        fi.sync_all().unwrap();
+        
+        let mut l = Vec::new();
+        for i in writting{
+            let len = i.1.len();
+            l.push(WriteEntry{
+                buffer: Arc::new(i.1),
+                length: len,
+                offset: i.0 as i64
+            });
+        }
+        let l_1 = l.len();
+        let c= self.file.clone();
+        tokio::spawn(async move{
+            batch_write_data(l, l_1, c.lock().await.as_raw_fd()).await;
+        });
+        
+        
         Ok(())
     }
     

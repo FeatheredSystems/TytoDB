@@ -1,10 +1,9 @@
 use std::{collections::HashMap, io::{self, Error, ErrorKind}, mem::discriminant, ops::{Range, RangeInclusive}};
 
-use aes_gcm::aead::consts::U9223372036854775808;
 use ahash::AHashMap;
-use regex::{Regex, Replacer};
+use regex::Regex;
 
-use crate::{alba_types::AlbaTypes, gerr, indexing::GetIndex, Token, loginfo, query::PrimitiveQueryConditions, row::Row};
+use crate::{alba_types::AlbaTypes, gerr, Token, query::PrimitiveQueryConditions, row::Row};
 
 
 fn string_to_char(s: String) -> Result<char, io::Error> {
@@ -22,28 +21,16 @@ enum LogicalGate{
     Or,
 }
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub struct QueryConditionAtom{
     column : String,
     operator : Operator,
     value : AlbaTypes,
 }
-#[derive(Clone,Default)]
+#[derive(Clone,Default,Debug)]
 pub struct QueryConditions{
     primary_key : Option<String>,
     chain : Vec<(QueryConditionAtom,Option<LogicalGate>)>
-}
-
-fn gather_regex<'a>(regex_map: &'a mut HashMap<String, Regex>, key: String) -> Result<&'a Regex, Error> {
-    if regex_map.contains_key(&key) {
-        return Ok(regex_map.get(&key).unwrap());
-    }
-    let reg = match Regex::new(&key) {
-        Ok(a) => a,
-        Err(e) => return Err(gerr(&e.to_string())),
-    };
-    regex_map.insert(key.clone(), reg);
-    Ok(regex_map.get(&key).unwrap())
 }
 
 #[derive(Debug)]
@@ -276,7 +263,7 @@ impl QueryConditions{
         }
         return Ok(QueryConditions { chain, primary_key : Some(primary_key)})
     }
-    pub fn row_match(&self, row: &Row) -> Result<bool, Error> {
+    pub fn row_match(&self, row: &Row,row_headers: &Vec<String>) -> Result<bool, Error> {
         
         
         if self.chain.is_empty() {
@@ -289,13 +276,19 @@ impl QueryConditions{
         
         
     
-        for (index, (query_condition, logical_gate)) in self.chain.iter().enumerate() {
+        for (query_condition, logical_gate) in self.chain.iter() {
             let column = &query_condition.column;
             let value = &query_condition.value;
+            println!("{:?}\t{:?}\t{:?}",query_condition,logical_gate,row);
+            let ci = {
+                let mut c = 0usize;
+                for i in row.data.iter().zip(row_headers.iter()).enumerate(){
+                    if *i.1.1 == *column{c = i.0;break;} ;
+                }
+                c
+            };
             
-            
-            
-            let row_value = if let Some(val) = row.data.get(column) {
+            let row_value = if let Some(val) = row.data.get(ci) {
                 
                 val
             } else {
@@ -533,17 +526,14 @@ impl QueryConditions{
         
         Ok(result)
     }
+
     pub fn query_type(&self) -> Result<QueryType, Error> {
-        loginfo!("Starting query type analysis");
-        
         // Early return for scan conditions
         if self.chain.is_empty() || self.primary_key.is_none() {
-            loginfo!("No chain or primary key found, defaulting to Scan");
             return Ok(QueryType::Scan);
         }
         
         let pk = self.primary_key.as_ref().unwrap();
-        loginfo!("Primary key: {:?}, chain length: {}", pk, self.chain.len());
         
         let mut range: LogicCell = ((0, 0), (false, false), false);
         let l = self.chain.len();
@@ -554,15 +544,12 @@ impl QueryConditions{
         let ad = discriminant(&LogicalGate::And);
         
         // Process chain into logic cells and gates
-        loginfo!("Processing {} chain elements", self.chain.len());
-        for (idx, i) in self.chain.iter().enumerate() {
+        for i in self.chain.iter() {
             if i.0.column != *pk {
-                loginfo!("Chain[{}]: Column {:?} != primary key, skipping", idx, i.0.column);
                 logic_cells.push(((0, 0), (false, false), false));
             } else {
-                let index = i.0.value.get_index();
-                let cell = i.0.operator.get_range(index);
-                loginfo!("Chain[{}]: Primary key match, operator range: {:?}", idx, cell);
+                let index = i.0.value.get_id();
+                let cell = i.0.operator.get_range(index as u64);
                 if !range_mutated{
                     range = cell.clone();
                     range_mutated = true;
@@ -572,111 +559,86 @@ impl QueryConditions{
             
             if let Some(logic_gate) = i.1 {
                 let is_and = ad == discriminant(&logic_gate);
-                loginfo!("Chain[{}]: Logic gate: {:?} (is_and: {})", idx, logic_gate, is_and);
                 gates.push(is_and);
             }
         }
-
-        loginfo!("Combining logic cells with gates");
-        for (idx, (cell, gate)) in logic_cells.iter().zip(gates.iter()).enumerate() {
-            loginfo!("Processing cell[{}]: {:?} with gate: {}", idx, cell, gate);
-            
+        for (cell, gate) in logic_cells.iter().zip(gates.iter()) {
             if range == ((0, 0), (false, false), false) {
-                loginfo!("First valid range, setting initial: {:?}", cell);
                 range = *cell;
                 continue;
             }
             
             if *gate { // AND operation
-                loginfo!("AND operation - intersecting ranges");
                 
                 // Handle null flag
                 if range.2 != cell.2 && cell.2 {
-                    loginfo!("Setting null flag from cell");
                     range.2 = cell.2;
                 }
                 
                 // Intersect upper bound
                 if range.0.1 == 0 && range.1.1 == true && cell.0.1 != 0 && cell.1.1 == false {
-                    loginfo!("Updating upper bound from cell: {} -> {}", range.0.1, cell.0.1);
                     range.0.1 = cell.0.1;
                     range.1.1 = false;
                 }
                 
                 // Intersect lower bound
                 if range.0.0 == 0 && range.1.0 == true && cell.0.0 != 0 && cell.1.0 == false {
-                    loginfo!("Updating lower bound from cell: {} -> {}", range.0.0, cell.0.0);
                     range.0.0 = cell.0.0;
                     range.1.0 = false;
                 }
             } else { // OR operation
-                loginfo!("OR operation - union of ranges");
                 
                 // Handle null flag
                 if range.2 || cell.2 {
-                    loginfo!("Setting null flag due to OR");
                     range.2 = true;
                 }
                 
                 // Expand lower bound (take minimum)
                 if cell.0.0 != 0 && (range.0.0 == 0 || cell.0.0 < range.0.0) {
-                    loginfo!("Expanding lower bound: {} -> {}", range.0.0, cell.0.0);
                     range.0.0 = cell.0.0;
                     range.1.0 = cell.1.0;
                 }
                 
                 // Expand upper bound (take maximum)
                 if cell.0.1 != 0 && (range.0.1 == 0 || cell.0.1 > range.0.1) {
-                    loginfo!("Expanding upper bound: {} -> {}", range.0.1, cell.0.1);
                     range.0.1 = cell.0.1;
                     range.1.1 = cell.1.1;
                 }
             }
-            
-            loginfo!("Range after processing cell[{}]: {:?}", idx, range);
         }
         
         // Normalize range bounds
         if range.0.0 == 0 && range.1.0 {
-            loginfo!("Normalizing lower bound to 0 (inclusive)");
             range.0.0 = 0;
             range.1.0 = false;
         }
         if range.0.1 == 0 && range.1.1 {
-            loginfo!("Normalizing upper bound to MAX (exclusive)");
             range.0.1 = u64::MAX;
             range.1.1 = false;
         }
         
-        loginfo!("Final range: {:?}", range);
         
         // Determine query type based on final range
         if range == ((0, 0), (false, false), false) {
-            loginfo!("Empty range, returning Scan");
             return Ok(QueryType::Scan);
         }
         
         if range.0.0 > range.0.1 {
-            loginfo!("Invalid range (lower > upper), returning Scan");
             return Ok(QueryType::Scan);
         }
         
         if range.2 && range.0.0 == range.0.1 {
-            loginfo!("Strict index query for value: {}", range.0.0);
             return Ok(QueryType::Indexed(QueryIndexType::Strict(range.0.0)));
         }
         
         if range.2 && range.0.0 != range.0.1 {
-            loginfo!("Inclusive range query: {}..={}", range.0.0, range.0.1);
             return Ok(QueryType::Indexed(QueryIndexType::InclusiveRange(range.0.0..=range.0.1)));
         }
         
         if !range.2 && range.0.0 != range.0.1 {
-            loginfo!("Exclusive range query: {}..{}", range.0.0, range.0.1);
             return Ok(QueryType::Indexed(QueryIndexType::Range(range.0.0..range.0.1)));
         }
-        
-        loginfo!("Fallback to Scan query type");
         Ok(QueryType::Scan)
     }
+
 }

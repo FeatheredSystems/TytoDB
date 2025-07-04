@@ -1133,7 +1133,6 @@ version = "0.1.0"
 dependencies = [
  "falcotcp 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
- "zstd",
 ]
 
 [[package]]

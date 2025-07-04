@@ -3,7 +3,6 @@ mod database;
 mod container;
 mod row;
 mod query;
-mod indexing;
 mod alba_types;
 mod query_conditions;
 use std::io::{Error,ErrorKind};
@@ -139,15 +138,11 @@ struct AstDeleteContainer{
     container : String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum AlbaContainer {
-    Real(String),
-    Virtual(AstSearch)
-}
+type AlbaContainer = String;
 
 #[derive(Debug, Clone, PartialEq)]
 struct AstSearch{
-    container : Vec<AlbaContainer>,
+    container : AlbaContainer,
     conditions : (Vec<(Token,Token,Token)>,Vec<(usize,char)>),
     col_nam : Vec<String>,
 }

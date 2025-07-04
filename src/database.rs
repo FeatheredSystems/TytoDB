@@ -1,12 +1,11 @@
-use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::unix::fs::FileExt, path::PathBuf, pin::Pin, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
 use ahash::AHashMap;
-use base64::{alphabet, engine::{self, GeneralPurpose}, Engine};
-use futures::future::UnwrapOrElse;
+use base64::{alphabet, engine::{self, GeneralPurpose}};
 use lazy_static::lazy_static;
 use serde::{Serialize,Deserialize};
 use serde_yaml;
-use crate::{alba_types::AlbaTypes, container::Container, gerr, indexing::Search, logerr, loginfo, query::{indexed_search, indexed_search_direct, search, search_direct, Query, SearchArguments}, query_conditions::{QueryConditions, QueryType}, AlbaContainer, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
-use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
+use crate::{alba_types::AlbaTypes, container::Container, gerr, logerr, query::{search, Query, SearchArguments}, query_conditions::QueryConditions, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
+use rand::{rngs::OsRng, RngCore};
 use tokio::sync::Mutex;
 /////////////////////////////////////////////////
 /////////     DEFAULT_SETTINGS    ///////////////
@@ -50,19 +49,39 @@ fn secret_key_path() -> String{
 /////////////////////////////////////////////////
 
 
+#[repr(C)]
+pub struct WriteEntryC{
+    pub buffer : *const u8,
+    pub length : usize,
+    pub offset : i64,
+}
+
+pub struct WriteEntry{
+    pub buffer : Arc<Vec<u8>>,
+    pub length : usize,
+    pub offset : i64,
+}
+impl WriteEntry{
+    fn to_c(&self) -> WriteEntryC{
+        WriteEntryC{
+            buffer : self.buffer.as_slice().as_ptr(),
+            length : self.length,
+            offset : self.offset,
+        }
+    }
+}
 
 #[link(name = "io", kind = "static")]
 unsafe extern "C" {
-    pub fn write_data(buffer: *const u8, len: usize, path: *const std::os::raw::c_char) -> i32;
+    
+    pub unsafe fn batch_write_data_c(buffer: *const WriteEntryC, len: usize, file: c_int) -> i32;
 }
 
-pub fn generate_secure_code(len: usize) -> String {
-    let mut rng = rand::rngs::OsRng;
-    let code: String = (0..len)
-        .map(|_| rng.sample(Alphanumeric))
-        .map(char::from)
-        .collect();
-    code
+pub async fn batch_write_data(buffer : Vec<WriteEntry>, len : usize, file: c_int) -> i32{
+    let buffer : Vec<WriteEntryC> = buffer.iter().map(|f|f.to_c()).collect();
+    unsafe{
+        return batch_write_data_c(buffer.as_ptr(), len, file);
+    }
 }
 
 #[derive(Default,Debug)]
@@ -156,14 +175,12 @@ impl Database{
             self.container.insert(
                 contain.to_string(),
                 Container::new(
-                    contain.to_string(),
                     &format!("{}/{}", self.location, contain),
-                    self.location.clone(),
                     element_size,
                     he.1,
                     MAX_STR_LEN,
                     header_offset,
-                    he.0.clone(),
+                    he.0
                 ).await.unwrap(),
             );
             
@@ -394,20 +411,19 @@ impl Database{
                 for i in structure.col_val.iter(){
                     el += i.size()
                 }
-                let c = Container::new(structure.name.clone(),
+                let c = Container::new(
                     &path,
-                    database_path(),
                     el,
-                    structure.col_val.clone(), 
+                    structure.col_val,
                     MAX_STR_LEN,
-                    header_size + 8,
-                    structure.col_nam.clone()
+                    header_size,
+                    structure.col_nam
                 ).await.unwrap();
                 self.container.insert(structure.name, c);
                 self.save_containers().unwrap();
             },
             AST::CreateRow(structure) => {
-                
+                println!("{:?}",structure);
                 let mut container = match self.container.get_mut(&structure.container) {
                     None => {
                         
@@ -447,295 +463,114 @@ impl Database{
                 
             },
             AST::Search(structure) => {
-                let mut query : Option<Query> = None;
-                for i in structure.container{
-                    
-                    if let AlbaContainer::Virtual(i) = i{
-                        let result_query = Box::pin(self.run(AST::Search(i))).await?;
-                            if let Some(ref mut q) = query{
-                                q.join(result_query);
-                            }else{
-                                query = Some(result_query)
-                            }
-                        
-                        continue;
-                    }
-                    
-                    if let AlbaContainer::Real(container_name) = i{
-                        let container = match self.container.get(&container_name){
-                            Some(a) => a,
-                            None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",container_name)))}
-                        };
-                        let container_book = container.lock().await;
-                        let header_types = container_book.headers.clone();
-
-                        
-                        let mut headers_hash_map = HashMap::new();
-                        for i in header_types.iter().cloned(){
-                            headers_hash_map.insert(i.0,i.1);
-                        }
-                        let qc = QueryConditions::from_primitive_conditions( structure.conditions.clone(), &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))}).unwrap();
-                        let qt = qc.query_type().unwrap();
-                        let element_size = container_book.element_size.clone();
-                        let headers_offset = container_book.headers_offset.clone();
-                        let file = container_book.file.clone();
-                        let indexing = container_book.indexing.clone();
-                        drop(container_book);
-                        let result = match qt{
-                            QueryType::Scan => { 
-                                
-                                let r = search(container.to_owned(), SearchArguments{
-                                    element_size,
-                                    header_offset: headers_offset as usize,
-                                    file,
-                                    container_values: header_types,
-                                    conditions: qc,
-                                }).await.unwrap();
-                                
-                                r
-                            },
-                            QueryType::Indexed(query_index_type) => {
-
-                                
-                                let values = match query_index_type{
-                                    crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
-                                    crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
-                                    crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
-                                }?;
-                                loginfo!("values: {:?}",values);
-                                let r = indexed_search(container.to_owned(), SearchArguments{
-                                    element_size,
-                                    header_offset: headers_offset as usize,
-                                    file,
-                                    container_values: header_types,
-                                    conditions: qc,
-                                },&values).await.unwrap();
-
-                                
-                                r
-                            }
-                        };
-
-                        
-                        match query{
-                            Some(ref mut b) => b.join(result),
-                            None => {query = Some(result)}
-                        }
-                    };
-                }
-                if let Some(q) = query{
-                    return Ok(q)
+                let container = if let Some(a) = self.container.get(&structure.container){
+                    a
                 }else{
-                    return Err(gerr("Error, no query result found"))
-                }
+                    return Err(gerr("There is no container with the given name"))
+                };
+                let sa = {
+                    let c = container.clone();
+                    let sa = c.lock().await;
+
+                    let col_prop = {
+                        let mut h = HashMap::new();
+                        for i in sa.headers.clone(){
+                            h.insert(i.0,i.1);
+                        }
+                        h
+                    };
+                    let pk = sa.headers[0].0.clone();
+                    SearchArguments { 
+                        element_size: sa.element_size.clone(),
+                        header_offset: sa.headers_offset.clone() as usize,
+                        file: sa.file.clone(),
+                        conditions: QueryConditions::from_primitive_conditions(structure.conditions,&col_prop,pk)?
+                    }
+                };
+                let rows = search(container.clone(), sa).await?.0;
+                return Ok(Query { rows: (container.lock().await.column_names(),rows) })
             },
             AST::EditRow(structure) => {
-                
-                let container = match self.container.get(&structure.container) {
-                    Some(a) => {
-                        
-                        a
-                    }
-                    None => {
-                        logerr!("No container named: {}", structure.container);
-                        return Err(gerr(&format!("Failed to perform the query, there is no container named {}", structure.container)))
-                    }
+                let container = if let Some(a) = self.container.get(&structure.container){
+                    a
+                }else{
+                    return Err(gerr("There is no container with the given name"))
                 };
-            
-                
-                let header_types = {
-                    let container_book = container.lock().await;
-                    
-                    container_book.headers.clone()
-                };
-                
-            
-                
-                let mut headers_hash_map = HashMap::new();
-                for i in header_types.iter().cloned() {
-                    headers_hash_map.insert(i.0, i.1);
-                }
-                
-            
-                
-                
-                let qc = QueryConditions::from_primitive_conditions(
-                    structure.conditions.clone(),
-                    &headers_hash_map,
-                    if let Some(a) = header_types.first() {
-                        a.0.clone()
-                    } else {
-                        logerr!("No primary key found");
-                        return Err(gerr("Error, no primary key found"))
-                    }
-                ).unwrap();
-            
-                
-                let container_book = container.lock().await;
-                
-                let qt = qc.query_type().unwrap();
-            
-                
-                let mut column_name_idx: AHashMap<String, usize> = AHashMap::new();
-                let mut changes: AHashMap<usize, AlbaTypes> = AHashMap::new();
-                for i in container_book.headers.iter().enumerate() {
-                    column_name_idx.insert(i.1.0.clone(), i.0);
-                }
-                for i in structure.col_nam.iter().enumerate() {
-                    let val = if let Some(v) = structure.col_val.get(i.0) {
-                        v
-                    } else {
-                        logerr!("Missing value for column: {}", i.1);
-                        return Err(gerr("Failed to execute edit because there is a value missing for one of the columns entered"))
+                let sa = {
+                    let c = container.clone();
+                    let sa = c.lock().await;
+
+                    let col_prop = {
+                        let mut h = HashMap::new();
+                        for i in sa.headers.clone(){
+                            h.insert(i.0,i.1);
+                        }
+                        h
                     };
-                    let id = column_name_idx.get(i.1).unwrap();
-                    changes.insert(*id, val.to_owned());
-                }
-                
-            
-                let element_size = container_book.element_size.clone();
-                let headers_offset = container_book.headers_offset.clone();
-                let file = container_book.file.clone();
-                let indexing = container_book.indexing.clone();
-                
-                drop(container_book);
-                
-            
-                let result: Vec<(Vec<AlbaTypes>, u64)> = {
-                    match qt {
-                        QueryType::Scan => {
-                            
-                            search_direct(container.clone(), SearchArguments {
-                                element_size,
-                                header_offset: headers_offset as usize,
-                                file,
-                                container_values: header_types,
-                                conditions: qc,
-                            }).await.unwrap()
-                        }
-                        QueryType::Indexed(query_index_type) => {
-                            
-                            let values = match query_index_type {
-                                crate::query_conditions::QueryIndexType::Strict(t) => {
-                                    
-                                    indexing.search(t).await
-                                }
-                                crate::query_conditions::QueryIndexType::Range(t) => {
-                                    
-                                    indexing.search(t).await
-                                }
-                                crate::query_conditions::QueryIndexType::InclusiveRange(t) => {
-                                    
-                                    indexing.search(t).await
-                                }
-                            }.unwrap();
-                            
-                            indexed_search_direct(container.clone(), SearchArguments {
-                                element_size,
-                                header_offset: headers_offset as usize,
-                                file,
-                                container_values: header_types,
-                                conditions: qc,
-                            }, &values).await.unwrap()
-                        }
-                    }.iter_mut().map(|f| {
-                        
-                        for (index, new_value) in &changes {
-                            f.0[*index] = new_value.clone();
-                        }
-                        f.to_owned()
-                    }).collect()
+                    let pk = sa.headers[0].0.clone();
+                    SearchArguments { 
+                        element_size: sa.element_size.clone(),
+                        header_offset: sa.headers_offset.clone() as usize,
+                        file: sa.file.clone(),
+                        conditions: QueryConditions::from_primitive_conditions(structure.conditions,&col_prop,pk)?
+                    }
                 };
-                
-            
-                
-                let container_book = container.lock().await;
-                
-                let mvcc = container_book.mvcc.clone();
-                drop(container_book);
-                
-            
-                
-                let mut mvcc = mvcc.lock().await;
-                
-                
-                for i in result {
-                    let ind = i.1.saturating_sub(headers_offset).saturating_div(element_size as u64);
-                    
-                    
-                    mvcc.0.insert(ind, (false, i.0));
+                let mut rows = search(container.clone(), sa).await?;
+
+                let c = container.lock().await;
+                let mut indexes = Vec::new();
+                for i in structure.col_nam.iter().enumerate(){
+                    for j in c.headers.iter().enumerate(){
+                        if *j.1.0 == *i.1{
+                            indexes.push((j.0,structure.col_val[i.0].clone()));
+                        }
+                    }
                 }
-            
+
+                for i in rows.0.iter_mut(){
+                    for j in indexes.iter(){
+                        i.data[j.0] = j.1.clone();
+                    }
+                }
+                for i in rows.0.iter().zip(rows.1.iter()){
+                    c.mvcc.lock().await.0.insert(*i.1, (false,i.0.data.clone()));
+                }
                 
+                return Ok(Query { rows: (vec![],vec![]) })
             },
             AST::DeleteRow(structure) => {
-                
-                let container = match self.container.get(&structure.container){
-                    Some(a) => a,
-                    None => {return Err(gerr(&format!("Failed to perform the query, there is no container named {}",structure.container)))}
+                let container = if let Some(a) = self.container.get(&structure.container){
+                    a
+                }else{
+                    return Err(gerr("There is no container with the given name"))
                 };
-                let header_types = container.lock().await.headers.clone();
+                let sa = {
+                    let c = container.clone();
+                    let sa = c.lock().await;
 
-                let mut headers_hash_map = HashMap::new();
-                for i in header_types.iter().cloned(){
-                    headers_hash_map.insert(i.0,i.1);
-                }
-                
-                let qc = QueryConditions::from_primitive_conditions( if let Some(c) = structure.conditions{c}else{(Vec::new(),Vec::new())}, &headers_hash_map,if let Some(a) = header_types.first(){a.0.clone()}else{return Err(gerr("Error, no primary key found"))})?;
-                let container_book = container.lock().await;
-                let element_size = container_book.element_size.clone();
-                let headers_offset = container_book.headers_offset.clone();
-                let file = container_book.file.clone();
-                let indexing = container_book.indexing.clone();
-                let qt = qc.query_type()?;
-                
-                drop(container_book);
-                let result : Vec<(Vec<AlbaTypes>,u64)> = match qt{
-                    QueryType::Scan => { 
-                        
-                        let r = search_direct(container.clone(), SearchArguments{
-                            element_size,
-                            header_offset: headers_offset as usize,
-                            file,
-                            container_values: header_types,
-                            conditions: qc,
-                        }).await?;
-                        
-                        
-                        r
-                    }
-                    QueryType::Indexed(query_index_type) => {
-
-                        
-                        let values = match query_index_type{
-                            crate::query_conditions::QueryIndexType::Strict(t) => indexing.search(t).await,
-                            crate::query_conditions::QueryIndexType::Range(t) => indexing.search(t).await,
-                            crate::query_conditions::QueryIndexType::InclusiveRange(t) => indexing.search(t).await,
-                        }?;
-
-                        
-                        let r= indexed_search_direct(container.clone(), SearchArguments{
-                            element_size,
-                            header_offset: headers_offset as usize,
-                            file,
-                            container_values: header_types,
-                            conditions: qc,
-                        },&values).await?;
-
-                        
-                        r
+                    let col_prop = {
+                        let mut h = HashMap::new();
+                        for i in sa.headers.clone(){
+                            h.insert(i.0,i.1);
+                        }
+                        h
+                    };
+                    let pk = sa.headers[0].0.clone();
+                    SearchArguments { 
+                        element_size: sa.element_size.clone(),
+                        header_offset: sa.headers_offset.clone() as usize,
+                        file: sa.file.clone(),
+                        conditions: QueryConditions::from_primitive_conditions(if let Some(a) = structure.conditions{a}else{(Vec::new(),Vec::new())},&col_prop,pk)?
                     }
                 };
                 
-                let container_book = container.lock().await;
-                let mut mvcc = container_book.mvcc.lock().await;
-                for i in result{
-                    let k = (i.1-headers_offset)/element_size as u64;
-                    
-                    mvcc.0.insert(k, (true,i.0));
+                let (_,indexes) = search(container.clone(), sa).await?;
+                let container = container.lock().await;
+                let mut mvcc = container.mvcc.lock().await;
+                for i in indexes{
+                    mvcc.0.insert(i,(true,Vec::new()));
                 }
-
-                
+                return Ok(Query{rows:(Vec::new(),Vec::new())})
             },
             AST::DeleteContainer(structure) => {
                 
@@ -774,7 +609,7 @@ impl Database{
                                 
                                 a.lock().await.commit().await.unwrap();
                                 
-                                return Ok(Query::new(Vec::new()));
+                                return Ok(Query{rows:(Vec::new(),Vec::new())});
                             },
                             None => {
                                 
@@ -798,7 +633,7 @@ impl Database{
                                 
                                 a.lock().await.rollback().await?;
                                 
-                                return Ok(Query::new(Vec::new()));
+                                return Ok(Query{rows:(Vec::new(),Vec::new())});
                             },
                             None => {
                                 
@@ -815,7 +650,7 @@ impl Database{
             }
         }
         
-        Ok(Query::new_none(Vec::new()))
+        Ok(Query{rows: (Vec::new(),Vec::new())})
     }
     
     // pub async fn execute(&mut self, input: &str, arguments: Vec<String>) -> Result<Query, Error> {
@@ -863,7 +698,7 @@ pub async fn connect() -> Result<Database, Error>{
 }
 
 
-use tytodb_conn::{commands::{AlbaContainer as NetworkAlbaContainer, Commands as commands, Compile, CreateContainer}, db_response::DBResponse, logical_operators::LogicalOperator};
+use tytodb_conn::{commands::Commands as commands, db_response::{DBResponse, Row as NetRow}, logical_operators::LogicalOperator};
 use tytodb_conn::types::AlbaTypes as NetworkAlbaTypes;
 
 fn ab_from_nat(a : NetworkAlbaTypes) -> AlbaTypes{
@@ -882,54 +717,39 @@ fn ab_from_nat(a : NetworkAlbaTypes) -> AlbaTypes{
         NetworkAlbaTypes::Bytes(items) => AlbaTypes::LargeBytes(items),
     }
 }
-
-
-impl Query {
-    fn to_row_list(&self) -> Vec<tytodb_conn::db_response::Row> {
-        let mut a: Vec<tytodb_conn::db_response::Row> = Vec::new();
-        for i in self.rows.1.iter() {
-            let row_data: Vec<NetworkAlbaTypes> = i.iter().map(|a| {
-                match a {
-                    AlbaTypes::Text(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::Int(i) => NetworkAlbaTypes::I32(*i),
-                    AlbaTypes::Bigint(i) => NetworkAlbaTypes::I64(*i),
-                    AlbaTypes::Float(f) => NetworkAlbaTypes::F64(*f),
-                    AlbaTypes::Bool(b) => NetworkAlbaTypes::Bool(*b),
-                    AlbaTypes::Char(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::NanoString(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::SmallString(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::MediumString(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::BigString(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::LargeString(s) => NetworkAlbaTypes::String(s.to_string()),
-                    AlbaTypes::NanoBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
-                    AlbaTypes::SmallBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
-                    AlbaTypes::MediumBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
-                    AlbaTypes::BigSBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
-                    AlbaTypes::LargeBytes(items) => NetworkAlbaTypes::Bytes(items.clone()),
-                    AlbaTypes::NONE => NetworkAlbaTypes::U8(0),
-                }
-            }).collect();
-            
-            a.push(tytodb_conn::db_response::Row::new(row_data)); // or however Row is constructed
-        }
-        a
+fn ab_to_nat(a : AlbaTypes) -> NetworkAlbaTypes{
+    match a{
+        AlbaTypes::Text(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::Int(a) => NetworkAlbaTypes::I32(a),
+        AlbaTypes::Bigint(a) => NetworkAlbaTypes::I64(a),
+        AlbaTypes::Float(a) => NetworkAlbaTypes::F64(a),
+        AlbaTypes::Bool(a) => NetworkAlbaTypes::Bool(a),
+        AlbaTypes::Char(a) => NetworkAlbaTypes::String(a.to_string()),
+        AlbaTypes::NanoString(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::SmallString(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::MediumString(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::BigString(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::LargeString(a) => NetworkAlbaTypes::String(a),
+        AlbaTypes::NanoBytes(a) => NetworkAlbaTypes::Bytes(a),
+        AlbaTypes::SmallBytes(a) => NetworkAlbaTypes::Bytes(a),
+        AlbaTypes::MediumBytes(a) => NetworkAlbaTypes::Bytes(a),
+        AlbaTypes::BigSBytes(a) => NetworkAlbaTypes::Bytes(a),
+        AlbaTypes::LargeBytes(a) => NetworkAlbaTypes::Bytes(a),
+        AlbaTypes::NONE => NetworkAlbaTypes::U8(0),
     }
 }
+fn abl_to_nat(a : Vec<AlbaTypes>) -> Vec<NetworkAlbaTypes>{
+    a.iter().map(|f|ab_to_nat(f.to_owned())).collect()
+}
 
+fn query_to_bytes(q : Query) -> Vec<u8>{
+    row_list_to_bytes(q.rows.1.iter().map(|f|NetRow::new(abl_to_nat(f.data.to_owned()))).collect())
+}
 
 fn row_list_to_bytes(a : Vec<tytodb_conn::db_response::Row>) -> Vec<u8>{
-    let mut b = Vec::new(); 
-    for i in a{
-        b.extend_from_slice(&i.encode());
-    }
-    b
+   DBResponse::new(a).encode()
 }
 
-fn boop(q : Query) -> Vec<u8>{
-    let mut byte = vec![0u8];
-    byte.extend_from_slice(&row_list_to_bytes(q.to_row_list()));
-    return byte
-}
 fn alba_types_to_token(alba_type: AlbaTypes) -> Token {
     match alba_type {
         AlbaTypes::Text(s) => Token::String(s),
@@ -968,25 +788,9 @@ fn conditions_to_tyto_db(t: (Vec<(String, LogicalOperator, NetworkAlbaTypes)>, V
             }),
             (alba_types_to_token(ab_from_nat(f.2.clone()))) // Convert AlbaTypes to Token
         )
-    }).collect(), t.1)
+    }).collect(), t.1.iter().map(|f|{(f.0 , f.1)}).collect())
 }
 
-fn build_ast_search_from_search(search : tytodb_conn::commands::Search) -> AstSearch{
-    AstSearch{            
-        col_nam: search.col_nam,
-        container: {
-            let mut a = Vec::new();
-            for f in search.container{
-                a.push(match f {
-                    NetworkAlbaContainer::Real(a) => AlbaContainer::Real(a),
-                    NetworkAlbaContainer::Virtual(searchs) => AlbaContainer::Virtual(build_ast_search_from_search(searchs)),
-                });
-            }
-            a
-        },
-        conditions: conditions_to_tyto_db(search.conditions)
-    }
-}
 use falcotcp::Server;
 impl Database{
     pub async fn run_database(self) -> Result<(), Error>{
@@ -1024,14 +828,7 @@ impl Database{
 
         let message_handler: Arc<(dyn Fn(Vec<u8>) -> Pin<Box<(dyn futures::Future<Output = Vec<u8>> + std::marker::Send + 'static)>> + std::marker::Send + Sync + 'static)> = Arc::new(move |input: Vec<u8>| { Box::pin(async move {
             println!("bytes tytodb received: {:?}",input);
-            match commands::decompile(&match zstd::bulk::decompress(&input,input.len()){
-                Ok(a) => a,
-                Err(e) => {
-                    let mut b = vec![1u8];
-                    b.extend_from_slice(&e.to_string().as_bytes());
-                    return b
-                }
-            }){
+            query_to_bytes(match commands::decompile(&input){
                 Ok(a) => {
                     match a{
                         commands::CreateContainer(create_container) => {
@@ -1056,7 +853,7 @@ impl Database{
                             })).await;
                             match c {
                                 Ok(q) => {
-                                    return boop(q)
+                                    q
                                 }
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
@@ -1071,7 +868,7 @@ impl Database{
                                 col_val: create_row.col_val.iter().map(|f|{ab_from_nat(f.clone())}).collect(),
                                 container: create_row.container
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1084,9 +881,9 @@ impl Database{
                                 col_nam: edit_row.col_nam,
                                 col_val: edit_row.col_val.iter().map(|f|{ab_from_nat(f.clone())}).collect(),
                                 container: edit_row.container,
-                                conditions: conditions_to_tyto_db(edit_row.conditions)
+                                conditions: conditions_to_tyto_db((edit_row.conditions.0,edit_row.conditions.1.iter().map(|f|{(f.0 as usize,f.1)}).collect()))
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1099,7 +896,7 @@ impl Database{
                                 container: delete_row.container,
                                 conditions: if let Some(s) = delete_row.conditions{Some(conditions_to_tyto_db(s))}else{None}
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1111,7 +908,7 @@ impl Database{
                             match mtx_db.lock().await.run(AST::DeleteContainer(AstDeleteContainer{
                                 container: delete_container.container,
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1123,21 +920,11 @@ impl Database{
                             let mtx_db = &mtx_db;
                             async fn a(search: tytodb_conn::commands::Search,mtx_db: &'static Arc<Mutex<Database>>) -> Vec<u8>{
                                 match mtx_db.lock().await.run(AST::Search(AstSearch{
-                                
                                     col_nam: search.col_nam,
-                                    container: {
-                                        let mut a = Vec::new();
-                                        for f in search.container{
-                                            a.push(match f {
-                                                NetworkAlbaContainer::Real(a) => AlbaContainer::Real(a),
-                                                NetworkAlbaContainer::Virtual(searchs) => AlbaContainer::Virtual(build_ast_search_from_search(searchs)),
-                                            })
-                                        }
-                                        a
-                                    },
-                                    conditions: conditions_to_tyto_db(search.conditions)
+                                    container: search.container,
+                                    conditions: conditions_to_tyto_db((search.conditions.0,search.conditions.1.iter().map(|f|{(f.0 as usize ,f.1)}).collect()))
                                 })).await{
-                                    Ok(a) => {boop(a)},
+                                    Ok(a) => query_to_bytes(a),
                                     Err(e) => {
                                         let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                         b.extend_from_slice(&e.to_string().as_bytes());
@@ -1145,13 +932,13 @@ impl Database{
                                     }
                                 }
                             }
-                            a(search,&mtx_db).await
+                            return a(search,&mtx_db).await
                         },
                         commands::Commit(commit) => {
                             match mtx_db.lock().await.run(AST::Commit(AstCommit{
                                 container: commit.container
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1163,7 +950,7 @@ impl Database{
                             match mtx_db.lock().await.run(AST::Rollback(AstRollback{
                                 container: rollback.container,
                             })).await{
-                                Ok(a) => return boop(a),
+                                Ok(a) => a,
                                 Err(e) => {
                                     let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
                                     b.extend_from_slice(&e.to_string().as_bytes());
@@ -1178,8 +965,7 @@ impl Database{
                     b.extend_from_slice(e.to_string().as_bytes());
                     return b
                 }
-            };
-            return vec![1u8,115, 111, 109, 101, 116, 104, 105, 110, 103, 32, 117, 110, 101, 120, 112, 101, 99, 116, 101,100, 32, 104, 97, 112, 112, 101, 110, 101, 100]
+            })
         })});
         Server::new(host, password, message_handler, workers).await
     }

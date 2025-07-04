@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
 use crate::alba_types::AlbaTypes;
 
 
-#[derive(Clone,Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Row{
-    pub data : HashMap<String,AlbaTypes>,
+    pub data : Vec<AlbaTypes>,
 }

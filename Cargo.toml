@@ -10,23 +10,15 @@ cc = "1.0"
 
 [dependencies]
 rand = "0.8" 
-rand_chacha = "0.3"
 serde = {version="1.0.219", features=["derive"]}
 serde_yaml = "0.9"
 futures = "0.3"
 regex = "1.11.1"
-blake3 = "1.8.1"
 aes-gcm = "0.10.3"
 lazy_static = "1.5.0"
-rust-lzma = "0.6.0"
-serde_json = "1.0.140"
 base64 = "0.22.1"
-ahash = "0.8.11"
-xxhash-rust = {version="0.8.15",features=["const_xxh3"]}
-chrono = "0.4.41"
-zmq = "0.10.0"
 num_cpus = "1.16.0"
 tytodb-conn = {path = "/home/theo/Documents/coding/TytoDB-ConnHandler/", version="0.1.0",default-features = false, features=["tokio"] }
 falcotcp = {path = "/home/theo/Documents/coding/FalcoTCP/", features=["tokio-runtime"],default-features = false, version="0.1.2"}
 tokio = {version="1.45.1",features=["full"]}
-zstd = "0.13.3"
+blake3 = "1.8.2"

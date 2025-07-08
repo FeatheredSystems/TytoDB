@@ -1,45 +1,25 @@
 
-use std::{collections::{BTreeSet, HashMap}, io::{Error, ErrorKind}, os::fd::AsRawFd, sync::Arc};
-use ahash::AHashMap;
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, io::{Error, ErrorKind}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
+
 use tokio::sync::Mutex;
-use crate::{alba_types::AlbaTypes, database::{batch_write_data, WriteEntry}, gerr};
+use crate::{alba_types::{into_schema, AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr};
 
 
-type MvccType = Arc<Mutex<(AHashMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
+type MvccType = Arc<Mutex<(BTreeMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
 #[derive(Debug)]
 pub struct Container{
     pub file : Arc<Mutex<std::fs::File>>,
     pub element_size : usize,
     pub headers : Vec<(String,AlbaTypes)>,
-    pub str_size : usize,
     pub mvcc : MvccType,
     pub headers_offset : u64,
     pub graveyard : Arc<Mutex<BTreeSet<u64>>>
 
 }
-fn serialize_closed_string(item : &AlbaTypes,s : &String,buffer : &mut Vec<u8>){
-    let mut bytes = Vec::with_capacity(item.size());
-    let mut str_bytes = s.as_bytes().to_vec();
-    let str_length = str_bytes.len().to_le_bytes().to_vec();
-    str_bytes.truncate(item.size()-size_of::<usize>());
-    bytes.extend_from_slice(&str_length);
-    bytes.extend_from_slice(&str_bytes);
-    bytes.resize(item.size(),0);
-    buffer.extend_from_slice(&bytes);
-}
-fn serialize_closed_blob(item : &AlbaTypes,blob : &mut Vec<u8>,buffer : &mut Vec<u8>){
-    let mut bytes: Vec<u8> = Vec::with_capacity(item.size());
-    let blob_length: Vec<u8> = blob.len().to_le_bytes().to_vec();
-    blob.truncate(item.size()-size_of::<usize>());
-    bytes.extend_from_slice(&blob_length);
-    bytes.extend_from_slice(blob);
-    bytes.resize(item.size(),0);
-    buffer.extend_from_slice(&bytes);
-}
 
 
 impl Container {
-    pub async fn new(path : &str,element_size : usize, columns : Vec<AlbaTypes>,str_size : usize,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
+    pub async fn new(path : &str,element_size : usize, columns : Vec<AlbaTypes>,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
         let mut  headers = Vec::new();
         for index in 0..((columns.len()+column_names.len())/2){
             let name = match column_names.get(index){
@@ -68,13 +48,12 @@ impl Container {
             hash_header.insert(i.0.clone(),i.1.clone());
         }
         let container = Arc::new(Mutex::new(Container{
-            file:file.clone(),
             element_size: element_size.clone(),
-            str_size,
-            mvcc: Arc::new(Mutex::new((AHashMap::new(),HashMap::new()))),
+            mvcc: Arc::new(Mutex::new((BTreeMap::new(),HashMap::new()))),
             headers_offset: headers_offset.clone() ,
             headers,
-            graveyard: Arc::new(Mutex::new(BTreeSet::new()))
+            graveyard: Arc::new(Mutex::new(BTreeSet::new())),
+            file
         }));
         Ok(container)
     }
@@ -93,13 +72,13 @@ fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values:
     if bytes.len() <= 8 {
         return Err(gerr("Not insuficient string size"));
     }
-    let string_length = usize::from_le_bytes(size);
+    let string_length = u64::from_le_bytes(size);
     let string_bytes = if string_length > 0 {
         let l = bytes.len();
-        if (string_length+8) >= l {
+        if (string_length+8) >= l as u64 {
             &bytes[8..]
         }else{
-           &bytes[8..(8+string_length)] 
+           &bytes[8..(8+string_length as usize)] 
         }
         
     }else{
@@ -138,12 +117,12 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
     let bytes = buf[*index..*index+size].to_vec();
     let mut blob_size : [u8;8] = [0u8;8];
     blob_size.clone_from_slice(&bytes[..8]); 
-    let blob_length = usize::from_le_bytes(blob_size);
+    let blob_length = u64::from_le_bytes(blob_size);
     let blob : Vec<u8> = if blob_length > 0 {
-        if blob_length >= bytes.len() {
+        if blob_length >= bytes.len() as u64{
             bytes[8..].to_vec()
         }else{
-           bytes[8..(8+blob_length)].to_vec() 
+           bytes[8..(8+blob_length as usize)].to_vec() 
         }
         
     }else{
@@ -177,19 +156,6 @@ impl Container{
     pub async fn len(&self) -> Result<u64,Error>{
         Ok(self.file.lock().await.metadata()?.len())
     }
-    pub async fn arrlen(&self) -> Result<u64, Error> {
-        let file_len = self.len().await?;
-        let file_rows = if file_len > self.headers_offset {
-            (file_len - self.headers_offset) / self.element_size as u64
-        } else {
-            0
-        };
-        let mvcc_max = {
-            let mvcc = self.mvcc.lock().await;
-            mvcc.0.keys().copied().max().map_or(0, |max_index| max_index + 1)
-        };
-        Ok(file_rows.max(mvcc_max))
-    }
     // pub fn get_alba_type_from_column_name(&self,column_name : &String) -> Option<AlbaTypes>{
     //     for i in self.headers.iter(){
     //         if *i.0 == *column_name{
@@ -207,19 +173,19 @@ impl Container{
                 return Ok(id)
             }
         }
-        let current_rows = self.arrlen().await?;
-        let mvcc = self.mvcc.lock().await;
-        for (&key, (deleted, _)) in mvcc.0.iter() {
-            if *deleted {
-                return Ok(key);
-            }
+        let mv = self.mvcc.lock().await;
+        let m = mv.0.keys().max();
+        let size = self.file.lock().await.metadata()?.size();
+        if let Some(m) = m{
+            return Ok(*m+self.element_size as u64)
         }
-        Ok(current_rows)
+        Ok(size)
     } 
-    pub async fn push_row(&mut self, data : &Vec<AlbaTypes>) -> Result<(),Error>{
+    pub async fn push_row(&mut self, data : Vec<AlbaTypes>) -> Result<(),Error>{
         let ind = self.get_next_addr().await?;
         let mut mvcc_guard = self.mvcc.lock().await;
-        mvcc_guard.0.insert(ind, (false,data.clone()));
+        println!("PUSH_ROW - OFFSET : {}",ind);
+        mvcc_guard.0.insert(ind, (false,data));
         Ok(())
     }
     pub async fn rollback(&mut self) -> Result<(),Error> {
@@ -230,14 +196,13 @@ impl Container{
         Ok(())
     }
     pub async fn commit(&mut self) -> Result<(), Error> {
-        //let mut virtual_ward : AHashMap<usize, DataReference> = AHashMap::new();
+        //let mut virtual_ward : HashMap<usize, DataReference> = HashMap::new();
         let mut mvcc = self.mvcc.lock().await;
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         for (index, value) in mvcc.0.iter() {
             
-            let offset = (index * self.element_size as u64) + self.headers_offset;
-            let v = (offset, value.1.clone());
+            let v = (*index, value.1.clone());
             if value.0 {
                 deletes.push(v);
             } else {
@@ -247,24 +212,27 @@ impl Container{
         mvcc.0.clear();
         insertions.sort_by_key(|(index, _)| *index);
         deletes.sort_by_key(|(index, _)| *index);
-        let buf = vec![0u8; self.element_size];
 
-        let mut writting : Vec<(u64,Vec<u8>)> = Vec::with_capacity(insertions.len());
-
-        for (row_index, row_data) in insertions {
-            let serialized = self.serialize_row(&row_data)?;
+        let mut writting : Vec<(u64,Vec<u8>)> = Vec::new();
+        let schema = self.columns();
+        println!("schema {:?}",schema);
+        for (row_index, mut row_data) in insertions {
+            println!("\nrow_data: {:?}\n",row_data);
+            into_schema(&mut row_data, &schema)?;
+            let serialized = self.serialize_row(&row_data).unwrap();
             let offset = row_index;
             writting.push((offset,serialized));
         }
 
+        drop(schema);
 
-        let mut graveyard = self.graveyard.lock().await;
 
+        let buf = vec![0u8; self.element_size];
+        let mut gy = self.graveyard.lock().await;
         for del in &deletes {
             let offset = del.0;
-            let row_index = (offset - self.headers_offset) / self.element_size as u64;
+            gy.insert(offset);
             writting.push((offset,buf.clone()));
-            graveyard.insert(row_index);  
         }
         
         mvcc.1.clear();
@@ -285,9 +253,7 @@ impl Container{
         }
         let l_1 = l.len();
         let c= self.file.clone();
-        tokio::spawn(async move{
-            batch_write_data(l, l_1, c.lock().await.as_raw_fd()).await;
-        });
+        batch_write_data(l, l_1, c.lock().await.as_raw_fd()).await;
         
         
         Ok(())
@@ -297,79 +263,12 @@ impl Container{
         self.headers.iter().map(|v|v.1.clone()).collect()
     }
     pub fn serialize_row(&self, row: &[AlbaTypes]) -> Result<Vec<u8>, Error> {
-        let mut buffer = Vec::with_capacity(self.element_size);
-    
-        for (item, ty) in row.iter().zip(self.columns().iter()) {
-            
-            let item = &AlbaTypes::to_another(item, ty);
-            match (item, ty) {
-                (AlbaTypes::Bigint(v), AlbaTypes::Bigint(_)) => {
-                    buffer.extend_from_slice(&v.to_be_bytes());
-                },
-                (AlbaTypes::Int(v), AlbaTypes::Int(_)) => {
-                    buffer.extend_from_slice(&v.to_be_bytes());
-                },
-                (AlbaTypes::Float(v), AlbaTypes::Float(_)) => {
-                    buffer.extend_from_slice(&v.to_be_bytes());
-                },
-                (AlbaTypes::Bool(v), AlbaTypes::Bool(_)) => {
-                    buffer.push(if *v { 1 } else { 0 });
-                },
-                (AlbaTypes::Char(c), AlbaTypes::Char(_)) => {
-                    let code = *c as u32;
-                    buffer.extend_from_slice(&code.to_le_bytes());
-                },
-                (AlbaTypes::Text(s), AlbaTypes::Text(_)) => {
-                    let mut bytes = s.as_bytes().to_vec();
-                    bytes.resize(self.str_size, 0);
-                    buffer.extend_from_slice(&bytes);
-                },
-                (AlbaTypes::NanoString(s), AlbaTypes::NanoString(_)) => {
-                    serialize_closed_string(item,s,&mut buffer);
-                },
-                (AlbaTypes::SmallString(s), AlbaTypes::SmallString(_)) => {
-                    serialize_closed_string(item,s,&mut buffer);
-                },
-                (AlbaTypes::MediumString(s), AlbaTypes::MediumString(_)) => {
-                    serialize_closed_string(item,s,&mut buffer);
-                },
-                (AlbaTypes::BigString(s), AlbaTypes::BigString(_)) => {
-                    serialize_closed_string(item,s,&mut buffer);
-                },
-                (AlbaTypes::LargeString(s), AlbaTypes::LargeString(_)) => {
-                    serialize_closed_string(item,s,&mut buffer);
-                },
-                (AlbaTypes::NanoBytes(v ), AlbaTypes::NanoBytes(_)) => {
-                    let mut blob: Vec<u8> = v.to_owned();
-                    serialize_closed_blob(item, &mut blob, &mut buffer);
-                },
-                (AlbaTypes::SmallBytes(v), AlbaTypes::SmallBytes(_)) => {
-                    let mut blob: Vec<u8> = v.to_owned();
-                    serialize_closed_blob(item, &mut blob, &mut buffer);
-                },
-                (AlbaTypes::MediumBytes(v), AlbaTypes::MediumBytes(_)) => {
-                    let mut blob: Vec<u8> = v.to_owned();
-                    serialize_closed_blob(item, &mut blob, &mut buffer);
-                },
-                (AlbaTypes::BigSBytes(v), AlbaTypes::BigSBytes(_)) => {
-                    let mut blob: Vec<u8> = v.to_owned();
-                    serialize_closed_blob(item, &mut blob, &mut buffer);
-                },
-                (AlbaTypes::LargeBytes(v), AlbaTypes::LargeBytes(_)) => {
-                    let mut blob: Vec<u8> = v.to_owned();
-                    serialize_closed_blob(item, &mut blob, &mut buffer);
-                },
-                (AlbaTypes::NONE, AlbaTypes::NONE) => {
-                    let size = item.size();
-                    buffer.extend(vec![0u8; size]);
-                },
-                _ => return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Type mismatch between value {:?} and column type {:?}", item, ty)
-                )),
-            }
+        let mut buffer = Vec::new();    
+        println!("rows: {:?}",row);
+        for i in row{
+            i.serialize_into(&mut buffer);
         }
-    
+        println!("data: {:?}",buffer);
         // Validate buffer size matches element_size
         if buffer.len() != self.element_size {
             return Err(Error::new(
@@ -381,7 +280,7 @@ impl Container{
                 )
             ));
         }
-    
+
         Ok(buffer)
     }
     pub async fn deserialize_row(&self, buf: &[u8]) -> Result<Vec<AlbaTypes>, Error> {

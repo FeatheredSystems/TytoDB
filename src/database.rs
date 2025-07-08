@@ -1,10 +1,8 @@
-use std::{collections::HashMap, fs, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
-use ahash::AHashMap;
-use base64::{alphabet, engine::{self, GeneralPurpose}};
-use lazy_static::lazy_static;
-use serde::{Serialize,Deserialize};
+use std::{collections::HashMap, fs::{self, File}, io::{Error, ErrorKind, Read, Write}, os::{fd::AsRawFd, raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
+
+use serde::{Deserialize, Serialize};
 use serde_yaml;
-use crate::{alba_types::AlbaTypes, container::Container, gerr, logerr, query::{search, Query, SearchArguments}, query_conditions::QueryConditions, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
+use crate::{alba_types::AlbaTypes, container::Container, gerr, logerr, query::{search, Query, SearchArguments}, query_conditions::QueryConditions, row::Row, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
 use rand::{rngs::OsRng, RngCore};
 use tokio::sync::Mutex;
 /////////////////////////////////////////////////
@@ -56,6 +54,19 @@ pub struct WriteEntryC{
     pub offset : i64,
 }
 
+#[repr(C)]
+pub struct ReadInstance{
+    pub size : u64,
+    pub offset : u64,
+    pub buffer : *mut u8,
+}
+
+#[repr(C)]
+pub struct ReadEntry{
+    pub buffer_array : *mut ReadInstance,
+    pub len : u64
+}
+
 pub struct WriteEntry{
     pub buffer : Arc<Vec<u8>>,
     pub length : usize,
@@ -73,14 +84,31 @@ impl WriteEntry{
 
 #[link(name = "io", kind = "static")]
 unsafe extern "C" {
-    
     pub unsafe fn batch_write_data_c(buffer: *const WriteEntryC, len: usize, file: c_int) -> i32;
+    unsafe fn batch_reads(re : *mut ReadEntry,file : i32) -> i32;
 }
 
-pub async fn batch_write_data(buffer : Vec<WriteEntry>, len : usize, file: c_int) -> i32{
-    let buffer : Vec<WriteEntryC> = buffer.iter().map(|f|f.to_c()).collect();
-    unsafe{
-        return batch_write_data_c(buffer.as_ptr(), len, file);
+pub fn batch_reads_abs(mut read_instances : Vec<ReadInstance>,file : &File) -> Result<(),Error>{
+    let mut r = ReadEntry{
+        len : read_instances.len() as u64,
+        buffer_array: read_instances.as_mut_ptr()
+    };
+    let a : i32 = unsafe{batch_reads(&mut r, file.as_raw_fd().clone())};
+
+    match a {
+        0 => Ok(()),
+        -1 => Err(Error::new(ErrorKind::Other, "Failed to get SQE")),
+        -2 => Err(Error::new(ErrorKind::Other, "Failed to init queue")),
+        -3 => Err(Error::new(ErrorKind::Other, "Failed to submit io_uring_submit")),
+        _ => Err(Error::new(ErrorKind::Other, "Something failed :P")),
+    }
+}
+
+pub async fn batch_write_data(entries: Vec<WriteEntry>, len: usize, file: c_int) -> i32 {
+    let c_buffer: Vec<WriteEntryC> = entries.iter().map(|f| f.to_c()).collect();
+    
+    unsafe {
+        batch_write_data_c(c_buffer.as_ptr(), len, file)
     }
 }
 
@@ -108,16 +136,53 @@ fn check_for_reference_folder(location : &String) -> Result<(), Error>{
 
 const SETTINGS_FILE : &str = "settings.yaml";
 
-lazy_static!{
-    static ref B64_ENGINE : GeneralPurpose = new_b64_engine();
-}
 
-fn new_b64_engine() -> GeneralPurpose{
-    let crazy_config = engine::GeneralPurposeConfig::new()
-        .with_decode_allow_trailing_bits(true)
-        .with_encode_padding(true)
-        .with_decode_padding_mode(engine::DecodePaddingMode::Indifferent);
-    return base64::engine::GeneralPurpose::new(&alphabet::Alphabet::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/").unwrap(), crazy_config);
+fn create_container_headers(column_names : Vec<String>,column_values : Vec<AlbaTypes>) -> Vec<u8>{
+    let mut byteload : Vec<u8> = Vec::new();
+    let len = column_names.len();
+    byteload.extend_from_slice(&(len as u64).to_le_bytes());
+    for i in column_names.into_iter().zip(column_values){
+        let size = i.0.len() as u64;
+        let mut b = Vec::new();
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&i.0.as_bytes());
+        b.push(i.1.get_id());
+        byteload.extend_from_slice(&b);
+    }
+    byteload
+}
+fn get_container_headers(file : &File) -> Result<(Vec<String>,Vec<AlbaTypes>,u64),Error>{
+    let mut offset = 0u64;
+    let column_count = {
+        let mut buf = [0u8;8];
+        file.read_exact_at(&mut buf, offset)?;
+        offset += 8;
+        u64::from_le_bytes(buf)
+    };
+
+    let mut col_nam = Vec::new();
+    let mut col_val = Vec::new();
+
+    for _ in 0..column_count{
+        let mut size_len = [0u8;8];
+        file.read_exact_at(&mut size_len, offset)?;
+        let str_size = u64::from_le_bytes(size_len);
+        offset += 8;
+
+        let mut str_buff = vec![0u8;str_size as usize];
+        file.read_exact_at(&mut str_buff, offset)?;
+        offset += str_size;
+
+        let mut column_type_buffer = [0u8;1];
+        file.read_exact_at(&mut column_type_buffer, offset)?;
+        offset += 1;
+
+        let column_name = String::from_utf8_lossy(&str_buff).to_string();
+        let column_type = AlbaTypes::from_id(column_type_buffer[0])?;
+        col_nam.push(column_name);
+        col_val.push(column_type);
+    }
+    Ok((col_nam,col_val,offset))
 }
 
 impl Database{
@@ -178,7 +243,6 @@ impl Database{
                     &format!("{}/{}", self.location, contain),
                     element_size,
                     he.1,
-                    MAX_STR_LEN,
                     header_offset,
                     he.0
                 ).await.unwrap(),
@@ -328,41 +392,13 @@ impl Database{
         let exists = fs::exists(&path)?;
         
         if exists {
-            let file = fs::File::open(&path)?;
-            let mut num_buffer = [0u8;8];
-            file.read_exact_at(&mut num_buffer, 0)?;
-            let header_size = u64::from_be_bytes(num_buffer);
-            let mut buffer = vec![0u8;header_size as usize];
-            file.read_exact_at(&mut buffer, 8)?;
-
-            let mut read = 0;
-            let mut column_names = Vec::new();
-            let mut column_values = Vec::new();
-            while read < buffer.len(){
-                let mut cnb = [0u8;2];
-                let mut atb = [0u8;1];
-                cnb.copy_from_slice(&buffer[read..(read+2)]);
-                read += 2;
-                atb.copy_from_slice(&buffer[read..(read+1)]);
-                read += 1;
-
-                let column_name_size = u16::from_be_bytes(cnb);
-                let alba_type_id = u8::from_be_bytes(atb);
-                let column_name = match String::from_utf8(buffer[..(column_name_size as usize)].to_vec()){
-                    Ok(a) => a.to_string(),
-                    Err(e) => {return Err(gerr(&e.to_string()))}
-                };
-                read += column_name_size as usize;
-                let alba_type = AlbaTypes::from_id(alba_type_id)?;
-                column_names.push(column_name);
-                column_values.push(alba_type);
-            }
-            return Ok(((column_names,column_values),header_size+8))
+            let mut file = fs::File::open(&path)?;
+            let val = get_container_headers(&mut file)?;
+            return Ok(((val.0,val.1),val.2 as u64))
         }
         
         Err(gerr("Container not found"))
     }
-    
     pub async fn run(&mut self, ast: AST) -> Result<Query, Error> {
         let min_column: usize = (self.settings.min_columns as usize).max(1);
         let max_columns: usize = self.settings.max_columns as usize;
@@ -386,37 +422,19 @@ impl Database{
                     return Err(gerr("Failed to create container, there is already a container with this name or a file with this name on the container directory."))
                 }
                 let mut file = fs::File::create_new(&path).unwrap();
-                let mut buffer : Vec<u8> = Vec::new();
-                for i in structure.col_nam.iter().zip(structure.col_val.iter()){
-                    let n = i.0.as_bytes();
-                    let m = i.1.get_id().to_be_bytes();
-                    if n.len() > u16::MAX as usize || m.len() > u16::MAX as usize{
-                        return Err(gerr(&format!("The maximum size in bytes of the column name is {}, and the current size is {}",u16::MAX,n.len())))
-                    }
-
-
-                    let column_name_size : u16 = n.len() as u16;
-                    let mut curr = Vec::new();
-                    curr.extend_from_slice(&column_name_size.to_be_bytes());
-                    curr.extend_from_slice(&m);
-                    curr.extend_from_slice(&n);
-                    buffer.extend_from_slice(&curr);
-                }
-                let header_size : u64 = buffer.len() as u64;
-                let mut buff = header_size.to_be_bytes().to_vec();
-                buff.extend_from_slice(&buffer); 
-                file.write_all(&buff).unwrap();
-                self.containers.push(structure.name.clone());
                 let mut el : usize = 0;
                 for i in structure.col_val.iter(){
                     el += i.size()
                 }
+
+                file.write_all(&create_container_headers( structure.col_nam.clone(), structure.col_val.clone())).unwrap();
+                self.containers.push(structure.name.clone());
+                
                 let c = Container::new(
                     &path,
                     el,
                     structure.col_val,
-                    MAX_STR_LEN,
-                    header_size,
+                    file.metadata()?.len(),
                     structure.col_nam
                 ).await.unwrap();
                 self.container.insert(structure.name, c);
@@ -440,24 +458,23 @@ impl Database{
                         structure.col_val.len()
                     )));
                 }
-                let mut val : Vec<AlbaTypes> = container.columns();
-                let cols = container.columns();
-                let mut hm = AHashMap::new();
-                for i in container.headers.iter().enumerate(){
-                    hm.insert(i.1.0.clone(),i.0);
+
+                let mut val  = container.columns();
+
+                let mut id_map = HashMap::new();
+                for i in container.column_names().into_iter().enumerate(){
+                    id_map.insert(i.1, i.0);
                 }
 
-                for i in structure.col_nam.iter().enumerate(){
-                    let j = hm.get(i.1);
-                    if let Some(a) = j{
-                        val.insert(*a,structure.col_val[i.0].clone().try_from_existing(cols[*a].clone())?);
+                for i in structure.col_nam.into_iter().enumerate(){
+                    let val1 = &structure.col_val[i.0];
+                    if let Some(a) = id_map.get(&i.1){
+                        val[*a] = val1.clone();
                     }
                 }
 
-
-                container.push_row(&val).await?;
+                container.push_row(val).await?;
                 if self.settings.auto_commit {
-                    
                     container.commit().await?;
                 }
                 
@@ -487,7 +504,9 @@ impl Database{
                         conditions: QueryConditions::from_primitive_conditions(structure.conditions,&col_prop,pk)?
                     }
                 };
+                println!("{:?}",sa);
                 let rows = search(container.clone(), sa).await?.0;
+                println!("rows: {:?}",rows);
                 return Ok(Query { rows: (container.lock().await.column_names(),rows) })
             },
             AST::EditRow(structure) => {
@@ -739,14 +758,19 @@ fn ab_to_nat(a : AlbaTypes) -> NetworkAlbaTypes{
     }
 }
 fn abl_to_nat(a : Vec<AlbaTypes>) -> Vec<NetworkAlbaTypes>{
+    println!("input abl: {:?}",a);
     a.iter().map(|f|ab_to_nat(f.to_owned())).collect()
 }
 
 fn query_to_bytes(q : Query) -> Vec<u8>{
-    row_list_to_bytes(q.rows.1.iter().map(|f|NetRow::new(abl_to_nat(f.data.to_owned()))).collect())
+    println!("input query: {:?}",q);
+    let a = row_list_to_bytes(q.rows.1.iter().map(|f|NetRow::new(abl_to_nat(f.data.to_owned()))).collect());
+    println!("returning bytes: {:?}",a);
+    a
 }
 
 fn row_list_to_bytes(a : Vec<tytodb_conn::db_response::Row>) -> Vec<u8>{
+    println!("rows_being_encoded: {:?}",a);
    DBResponse::new(a).encode()
 }
 
@@ -772,7 +796,7 @@ fn alba_types_to_token(alba_type: AlbaTypes) -> Token {
     }
 }
 fn conditions_to_tyto_db(t: (Vec<(String, LogicalOperator, NetworkAlbaTypes)>, Vec<(usize, char)>)) -> (Vec<(Token, Token, Token)>, Vec<(usize, char)>) {
-    (t.0.iter().map(|f| {
+    let a = (t.0.iter().map(|f| {
         (
             Token::String(f.0.clone()),
             Token::Operator(match f.1 {
@@ -788,7 +812,9 @@ fn conditions_to_tyto_db(t: (Vec<(String, LogicalOperator, NetworkAlbaTypes)>, V
             }),
             (alba_types_to_token(ab_from_nat(f.2.clone()))) // Convert AlbaTypes to Token
         )
-    }).collect(), t.1.iter().map(|f|{(f.0 , f.1)}).collect())
+    }).collect(), t.1.iter().map(|f|{(f.0 , f.1)}).collect());
+    println!("conditions: {:?}",a);
+    a
 }
 
 use falcotcp::Server;
@@ -828,7 +854,8 @@ impl Database{
 
         let message_handler: Arc<(dyn Fn(Vec<u8>) -> Pin<Box<(dyn futures::Future<Output = Vec<u8>> + std::marker::Send + 'static)>> + std::marker::Send + Sync + 'static)> = Arc::new(move |input: Vec<u8>| { Box::pin(async move {
             println!("bytes tytodb received: {:?}",input);
-            query_to_bytes(match commands::decompile(&input){
+            let mut val = vec![0u8];
+            val.extend_from_slice(&query_to_bytes(match commands::decompile(&input){
                 Ok(a) => {
                     match a{
                         commands::CreateContainer(create_container) => {
@@ -852,7 +879,9 @@ impl Database{
                                 col_val: col_v
                             })).await;
                             match c {
-                                Ok(q) => {
+                                Ok(mut q) => {
+                                    q.rows.0.push("s!".to_string());
+                                    q.rows.1.push(Row{data:vec![AlbaTypes::Bool(true)]});
                                     q
                                 }
                                 Err(e) => {
@@ -917,22 +946,20 @@ impl Database{
                             }
                         },
                         commands::Search(search) => {
+                            println!("command : Search");
                             let mtx_db = &mtx_db;
-                            async fn a(search: tytodb_conn::commands::Search,mtx_db: &'static Arc<Mutex<Database>>) -> Vec<u8>{
-                                match mtx_db.lock().await.run(AST::Search(AstSearch{
-                                    col_nam: search.col_nam,
-                                    container: search.container,
-                                    conditions: conditions_to_tyto_db((search.conditions.0,search.conditions.1.iter().map(|f|{(f.0 as usize ,f.1)}).collect()))
-                                })).await{
-                                    Ok(a) => query_to_bytes(a),
-                                    Err(e) => {
-                                        let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
-                                        b.extend_from_slice(&e.to_string().as_bytes());
-                                        return b
-                                    }
+                            match mtx_db.lock().await.run(AST::Search(AstSearch{
+                                col_nam: search.col_nam,
+                                container: search.container,
+                                conditions: conditions_to_tyto_db((search.conditions.0,search.conditions.1.iter().map(|f|{(f.0 as usize ,f.1)}).collect()))
+                            })).await{
+                                Ok(a) => a,
+                                Err(e) => {
+                                    let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                    b.extend_from_slice(&e.to_string().as_bytes());
+                                    return b
                                 }
                             }
-                            return a(search,&mtx_db).await
                         },
                         commands::Commit(commit) => {
                             match mtx_db.lock().await.run(AST::Commit(AstCommit{
@@ -965,7 +992,8 @@ impl Database{
                     b.extend_from_slice(e.to_string().as_bytes());
                     return b
                 }
-            })
+            }));
+            val
         })});
         Server::new(host, password, message_handler, workers).await
     }

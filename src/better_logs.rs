@@ -1,4 +1,4 @@
-use chrono::Local;
+
 use std::io::{self, Write};
 
 pub fn __logerr_with_loc(
@@ -6,12 +6,9 @@ pub fn __logerr_with_loc(
     line: u32,
     args: std::fmt::Arguments
 ) {
-    let now       = Local::now();
-    let timestamp = now.format("%Y/%m/%d %H:%M:%S");
     let _ = writeln!(
         io::stderr(),
-        "</ERROR/> {} [{}:{}] {}",
-        timestamp,
+        "</ERROR/> [{}:{}] {}",
         file,
         line,
         args
@@ -36,12 +33,9 @@ pub fn __loginfo_with_loc(
     line: u32,
     args: std::fmt::Arguments
 ) {
-    let now       = Local::now();
-    let timestamp = now.format("%Y/%m/%d %H:%M:%S");
     let _ = writeln!(
         io::stdout(),
-        "</INFO/> {} [{}:{}] {}",
-        timestamp,
+        "</INFO/> [{}:{}] {}",
         file,
         line,
         args

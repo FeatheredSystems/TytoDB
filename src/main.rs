@@ -1,4 +1,4 @@
-
+mod indexing;
 mod database;
 mod container;
 mod row;

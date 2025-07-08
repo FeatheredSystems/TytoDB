@@ -1,6 +1,4 @@
 use std::{collections::HashMap, io::{self, Error, ErrorKind}, mem::discriminant, ops::{Range, RangeInclusive}};
-
-use ahash::AHashMap;
 use regex::Regex;
 
 use crate::{alba_types::AlbaTypes, gerr, Token, query::PrimitiveQueryConditions, row::Row};
@@ -86,7 +84,7 @@ impl QueryConditions{
         let mut chain : Vec<(QueryConditionAtom,Option<LogicalGate>)> = Vec::new();
         let condition_chunk = primitive_conditions.0;
         let condition_logical_gates_vec = primitive_conditions.1;
-        let mut condition_logical_gates = AHashMap::new();
+        let mut condition_logical_gates = HashMap::new();
         for i in condition_logical_gates_vec{
             condition_logical_gates.insert(i.0, match i.1{
                 'a'|'A' => LogicalGate::And,
@@ -272,11 +270,11 @@ impl QueryConditions{
         }
         
         let mut result = false;
-        let mut regex_cache: AHashMap<String, Regex> = AHashMap::new();
+        let mut regex_cache: HashMap<String, Regex> = HashMap::new();
         
         
-    
-        for (query_condition, logical_gate) in self.chain.iter() {
+        let len = self.chain.len();
+        for (i,(query_condition, logical_gate)) in self.chain.iter().enumerate() {
             let column = &query_condition.column;
             let value = &query_condition.value;
             println!("{:?}\t{:?}\t{:?}",query_condition,logical_gate,row);
@@ -496,13 +494,12 @@ impl QueryConditions{
             };
             
             
-            
+            println!("check:{}",check);
             if let Some(gate) = logical_gate {
-                
+                if i == len-1 {return Ok(check)}
                 match gate {
                     LogicalGate::And => {
                         if !check {
-                            
                             result = false;
                             break;
                         }
@@ -518,7 +515,6 @@ impl QueryConditions{
                     }
                 }
             } else {
-                
                 result = check;
             }
         }
@@ -537,8 +533,8 @@ impl QueryConditions{
         
         let mut range: LogicCell = ((0, 0), (false, false), false);
         let l = self.chain.len();
-        let mut logic_cells: Vec<LogicCell> = Vec::with_capacity(l);
-        let mut gates: Vec<bool> = Vec::with_capacity(l);
+        let mut logic_cells: Vec<LogicCell> = Vec::new();
+        let mut gates: Vec<bool> = Vec::new();
         let mut range_mutated = false;
         
         let ad = discriminant(&LogicalGate::And);

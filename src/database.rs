@@ -67,6 +67,7 @@ pub struct WriteEntryC{
 //     pub len : u64
 // }
 
+#[derive(Clone)]
 pub struct WriteEntry{
     pub buffer : Arc<Vec<u8>>,
     pub length : usize,
@@ -120,18 +121,6 @@ pub struct Database{
     headers : Vec<(Vec<String>,Vec<AlbaTypes>)>,
     pub container : HashMap<String,Arc<Mutex<Container>>>,
 }
-
-fn check_for_reference_folder(location : &String) -> Result<(), Error>{
-    let path = format!("{}/rf",location);
-    if !match fs::exists(path.clone()){Ok(a)=>a,Err(e)=>{return Err(e)}}{
-        return match fs::create_dir(path){
-            Ok(a)=>Ok(a),
-            Err(e)=>Err(e)
-        }
-    }
-    Ok(())
-}
-
 
 
 const SETTINGS_FILE : &str = "settings.yaml";
@@ -202,8 +191,7 @@ impl Database{
     }
     
     async fn load_containers(&mut self) -> Result<(), Error> {
-        check_for_reference_folder(&database_path())?;
-        let path = format!("{}/containers.yaml", &self.location);
+         let path = format!("{}/containers.yaml", &self.location);
         if !fs::exists(&path).unwrap() {
             
             let yaml = serde_yaml::to_string(&self.containers)
@@ -246,35 +234,7 @@ impl Database{
                 ).await.unwrap(),
             );
             
-        }
-        for (_, wedfygt) in self.container.iter() {
-            let wedfygt = wedfygt.lock().await;
-            let count = (wedfygt.len().await? - wedfygt.headers_offset) / wedfygt.element_size as u64;
-            
-            if count < 1 {
-                
-                continue;
-            }
-            for i in 0..count {
-                
-                let mut wb = vec![0u8; wedfygt.element_size];
-                
-                if let Err(e) = wedfygt.file.lock().await.read_exact_at(
-                    &mut wb,
-                    wedfygt.headers_offset as u64 + (wedfygt.element_size as u64 * i as u64),
-                ) {
-                    logerr!("{}", e);
-                    
-                    continue;
-                };
-                if wb == vec![0u8; wedfygt.element_size] {
-                    
-                    wedfygt.graveyard.lock().await.insert(i);
-                    
-                }
-            }
-        }
-        
+        }        
         Ok(())
     }
     

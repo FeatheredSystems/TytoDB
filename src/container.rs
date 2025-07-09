@@ -1,10 +1,49 @@
 
-use std::{collections::{BTreeMap, BTreeSet, HashMap}, hash::{DefaultHasher, Hasher, Hash}, io::{Error, ErrorKind}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{self, File, OpenOptions}, hash::{DefaultHasher, Hash, Hasher}, io::{Error, ErrorKind, Read, Write}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
 use tokio::sync::Mutex;
-use crate::{alba_types::{into_schema, AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr, indexing:: Hashmap as IndexingHashMap};
+
+use crate::{alba_types::{into_schema,AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr, indexing:: Hashmap as IndexingHashMap};
 
 
 type MvccType = Arc<Mutex<(BTreeMap<u64,(MvccState,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
+
+#[derive(Debug)]
+pub struct MvccRecord(Arc<Mutex<File>>);
+impl MvccRecord{
+    fn new(name : String) -> Result<Self,Error>{
+        let file = OpenOptions::new().read(true).write(true).append(true).create(!fs::exists(&name)?).open(name)?;
+        Ok(MvccRecord(Arc::new(Mutex::new(file))))
+    }
+    async fn put(&mut self,bytes : Vec<u8>) -> Result<(),Error>{
+        let reference = self.0.clone();
+        let _ = tokio::task::spawn_blocking(async move || -> Result<(),Error> {
+            let mut bibi = reference.lock().await;
+            let e0 = bibi.write_all(&bytes);
+            let e1 = bibi.sync_all();
+            if let Err(e) = e0{eprintln!("ERROR{:?}",e)}
+            if let Err(e) = e1{eprintln!("ERROR {:?}",e)}
+            Ok(())
+        }).await;
+        Ok(())
+    }
+    async fn yield_(&mut self) -> Result<Vec<u8>,Error>{
+        let mut buffer = Vec::new();
+        self.0.lock().await.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+    async fn clear(&mut self) -> Result<(),Error> {
+        self.0.lock().await.set_len(0)?; Ok(())
+    }
+    async fn sync(&mut self) -> Result<(),Error>{
+        let reference = self.0.clone();
+        tokio::task::spawn_blocking(async move ||{    
+            let n = reference.lock().await;
+            n.sync_data();
+        });
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct Container{
     pub file : Arc<Mutex<std::fs::File>>,
@@ -13,7 +52,8 @@ pub struct Container{
     pub mvcc : MvccType,
     pub headers_offset : u64,
     pub graveyard : Arc<Mutex<BTreeSet<u64>>>,
-    pub index_map : Arc<Mutex<IndexingHashMap>>
+    pub index_map : Arc<Mutex<IndexingHashMap>>,
+    pub mvcc_record : Arc<Mutex<MvccRecord>>
 
 }
 #[derive(Debug,Copy,Clone)]
@@ -81,8 +121,10 @@ impl Container {
             headers,
             graveyard: Arc::new(Mutex::new(BTreeSet::new())),
             file,
+            mvcc_record: Arc::new(Mutex::new(MvccRecord::new(format!("{}.mr",path))?)),
             index_map: Arc::new(Mutex::new(IndexingHashMap::new(format!("{}.hm",path))?))
         }));
+        container.lock().await.load_mvcc().await?;
         Ok(container)
     }
     
@@ -195,31 +237,59 @@ impl Container{
     // }
 
     pub async fn get_next_addr(&self) -> Result<u64, Error> {
-        let mut graveyard = self.graveyard.lock().await;
-        if graveyard.len() > 0{
-            if let Some(id) = graveyard.pop_first(){
-                return Ok(id)
-            }
-        }
         let mv = self.mvcc.lock().await;
+        let mut gy = self.graveyard.lock().await;
+        if let Some(s) = gy.pop_first(){
+            return Ok(s)
+        }
         let m = mv.0.keys().max();
         let size = self.file.lock().await.metadata()?.size();
         if let Some(m) = m{
             return Ok(*m+self.element_size as u64)
         }
         Ok(size)
-    } 
+    }
+    pub async fn load_mvcc(&mut self) -> Result<(),Error>{
+        let mut mvcc_record = self.mvcc_record.lock().await;
+        let b = mvcc_record.yield_().await?;
+        let mut mvcc = self.mvcc.lock().await;
+        for i in b.chunks_exact(1 + self.element_size){
+            let s = match i[0] {0 => MvccState::Insert,1 => MvccState::Edit,_ => MvccState::Delete};
+            let row = self.deserialize_row(&i[1..self.element_size]).await?;
+            let key = {
+                let mut load = [0u8;8];
+                load[..].copy_from_slice(&i[self.element_size..]);
+                u64::from_le_bytes(load)
+            };
+            mvcc.0.insert(key, (s,row));
+        }
+        Ok(())
+    }
+    pub async fn record_mvcc(&mut self, key : u64, data : Vec<AlbaTypes>,state: MvccState) -> Result<(),Error>{
+        let mut b = Vec::new();
+        b.push(match state{MvccState::Delete => 2, MvccState::Insert => 0, MvccState::Edit => 1});
+        b.extend_from_slice(&self.serialize_row(&data)?);
+        b.extend_from_slice(&key.to_le_bytes());
+        let mut l = self.mvcc_record.lock().await;
+        l.put(b).await;
+        Ok(())
+    }
     pub async fn push_row(&mut self, data : Vec<AlbaTypes>) -> Result<(),Error>{
         let ind = self.get_next_addr().await?;
         let mut mvcc_guard = self.mvcc.lock().await;
         //println!("PUSH_ROW - OFFSET : {}",ind);
+        let d = data.clone();
         mvcc_guard.0.insert(ind, (MvccState::Insert,data));
+        drop(mvcc_guard);
+        self.record_mvcc(ind, d, MvccState::Insert).await;
         Ok(())
     }
     pub async fn rollback(&mut self) -> Result<(),Error> {
         let mut mvcc_guard = self.mvcc.lock().await;
         mvcc_guard.0.clear();
         mvcc_guard.1.clear();
+        let mut mvcc_rec = self.mvcc_record.lock().await;
+        mvcc_rec.clear().await;
         drop(mvcc_guard);
         Ok(())
     }
@@ -250,7 +320,7 @@ impl Container{
             //println!("\nrow_data: {:?}\n",row_data);
             into_schema(&mut row_data, &schema)?;
             let serialized = self.serialize_row(&row_data).unwrap();
-            index_batch.push((row_data[0].clone(),row_index.clone()));
+            index_batch.push((row_data[0].clone(),row_index));
             let offset = row_index;
             writting.push((offset,serialized));
         }
@@ -261,7 +331,7 @@ impl Container{
             let serialized = self.serialize_row(&row_data).unwrap();
             let key = get_index(row_data[0].clone());
             indexing.remove(key)?;
-            index_batch.push((row_data[0].clone(),row_index.clone()));
+            index_batch.push((row_data[0].clone(),row_index));
             let offset = row_index;
             writting.push((offset,serialized)); 
         }
@@ -279,7 +349,8 @@ impl Container{
             indexing.remove(key)?;
             writting.push((offset,buf.clone()));
         }
-        
+        let mut mvcc_record = self.mvcc_record.lock().await;
+        mvcc_record.clear().await?;
         mvcc.1.clear();
         mvcc.1.shrink_to_fit();
         // if let Some(s) = STRIX.get(){
@@ -296,17 +367,24 @@ impl Container{
                 offset: i.0 as i64
             });
         }
-        let l_1 = l.len();
-        let c= self.file.clone();
-        let a = batch_write_data(l, l_1, c.lock().await.as_raw_fd());
+;
+        let f = self.file.lock().await;
+        let c = f.as_raw_fd();
+
         
-        
+
+        for l in l.chunks(3000){
+            let l_1 = l.len();
+            batch_write_data(l.to_vec(), l_1, c).await;
+        }
+
         for (alb,off) in index_batch{
             let key = get_index(alb);
             indexing.insert(key,off)?;    
         };
         indexing.sync()?;
-        a.await;
+        
+        
         Ok(())
     }
     

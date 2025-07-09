@@ -3,7 +3,7 @@ use tokio::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{container::Container, Token, query_conditions::QueryConditions, row::Row};
+use crate::{container::Container, query_conditions::{QueryConditions, QueryIndexType, QueryType}, row::Row, Token};
 
 pub type PrimitiveQueryConditions = (Vec<(Token, Token, Token)>, Vec<(usize, char)>);
 
@@ -32,45 +32,53 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
     if size == args.header_offset{
         return Ok((Vec::new(),Vec::new()))
     }
-    
+    let column_names = &lck.column_names();
+    let qt = args.conditions.query_type()?;
+    if let QueryType::Indexed(QueryIndexType::Strict(u)) = qt{
+        println!("--> u={}",u);
+        if let Some(offset) = lck.index_map.lock().await.get(u)?{
+            let mut buff = vec![0u8;args.element_size];
+            file.read_exact_at(&mut buff, offset)?;
+            let b = Row{data:lck.deserialize_row(&buff).await?};
+            if args.conditions.row_match(&b, column_names)?{
+                return Ok((vec![b],vec![u]))
+            }else{
+                return Ok((Vec::new(),Vec::new()))
+            }
+        }else{
+            println!("not found :(");
+            return Ok((Vec::new(),Vec::new()))
+        }
+    }
+
     let total_rows = (file.metadata()?.len() as usize - args.header_offset)/args.element_size;
     let rows_per_it = (CHUNK_SIZE_BYTES / args.element_size).max(1);
     let chunk_size = (rows_per_it * args.element_size).min(total_rows*args.element_size);
     let count_its = (total_rows / rows_per_it).max(1);
-    
-    let column_names = lck.column_names();
-    let empty = vec![0u8;args.element_size];
-    println!("rows_per_it:{}",rows_per_it);
-    println!("chunk_size:{}",chunk_size);
-    println!("count_its:{}",count_its);
+    let gy = lck.graveyard.lock().await;
+    //let empty = vec![0u8;args.element_size];
 
     let mut rows = Vec::new();
     let mut offsets = Vec::new();
-    println!("ac : {:?}",args.conditions);
-    println!("element_size, {}",args.element_size);
     for i in 0..count_its{
-        println!("searching...");
+        if rows.len() == 100{
+            break;
+        }
         let mut buffer = vec![0u8;chunk_size];
         let file_offset = args.header_offset as u64 + (i * chunk_size) as u64;
         file.read_exact_at(&mut buffer, file_offset).unwrap();
-        println!("file_offset:{}",file_offset);
-        println!("buff: {:?}",buffer);
 
         for (j,row_bin) in buffer.chunks_exact(args.element_size).enumerate(){
-            println!("{}",j);
-            if row_bin == empty{continue;}
+            //if row_bin == empty{continue;}
             let offset_in_file = args.header_offset+i*chunk_size+j*args.element_size;
-            println!("offset_in_file: {}",offset_in_file);
-            let bare_row = lck.deserialize_row(&row_bin).await?;
+            if gy.get(&(offset_in_file as u64)).is_some(){continue;}; 
+            let bare_row = lck.deserialize_row(row_bin).await?;
             let row = Row { data: bare_row };
-            println!("row: {:?}",row);
             if args.conditions.row_match(&row, &column_names)?{
                 offsets.push(offset_in_file as u64);
                 rows.push(row);
-                println!("match");
             }
         }
     }
-    println!("searched");
     Ok((rows,offsets))
 }

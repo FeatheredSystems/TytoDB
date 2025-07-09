@@ -9,7 +9,6 @@ build = "build.rs"
 cc = "1.0"
 
 [dependencies]
-rand = "0.8" 
 serde = {version="1.0.219", features=["derive"]}
 serde_yaml = "0.9"
 futures = "0.3"
@@ -22,3 +21,4 @@ tytodb-conn = {path = "/home/theo/Documents/coding/TytoDB-ConnHandler/", version
 falcotcp = {path = "/home/theo/Documents/coding/FalcoTCP/", features=["tokio-runtime"],default-features = false, version="0.1.2"}
 tokio = {version="1.45.1",features=["full"]}
 blake3 = "1.8.2"
+rand = "0.9.1"

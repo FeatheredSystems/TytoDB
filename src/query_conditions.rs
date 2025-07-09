@@ -1,6 +1,7 @@
-use std::{collections::HashMap, io::{self, Error, ErrorKind}, mem::discriminant, ops::{Range, RangeInclusive}};
+use std::{collections::HashMap, io::{self, Error, ErrorKind}, mem::discriminant};
 use regex::Regex;
 
+use crate::container::get_index;
 use crate::{alba_types::AlbaTypes, gerr, Token, query::PrimitiveQueryConditions, row::Row};
 
 
@@ -34,8 +35,8 @@ pub struct QueryConditions{
 #[derive(Debug)]
 pub enum QueryIndexType {
     Strict(u64),
-    Range(Range<u64>),
-    InclusiveRange(RangeInclusive<u64>), 
+    // Range(Range<u64>),
+    // InclusiveRange(RangeInclusive<u64>), 
 }
 
 #[derive(Debug)]
@@ -57,23 +58,7 @@ enum Operator{
     StringCaseInsensitiveContains,
     StringRegularExpression
 }
-impl Operator{
-    fn get_range(&self,ind : u64) -> LogicCell{
-        match self{
-            Operator::Equal | Operator::StrictEqual => {((ind,ind),(false,false),true)},
-            Operator::Greater => {((ind,0),(false,true),false)},
-            Operator::Lower => {((0,ind),(true,false),false)},
-            Operator::GreaterEquality => {((ind,0),(false,true),true)},
-            Operator::LowerEquality => {((0,ind),(true,false),true)},
-            Operator::Different => {((0,0),(false,false),false)},
-            Operator::StringContains => {((0,0),(false,false),false)},
-            Operator::StringCaseInsensitiveContains => {((0,0),(false,false),false)},
-            Operator::StringRegularExpression => {((0,0),(false,false),false)},
-        }
-    }
-}
 
-type LogicCell = ((u64,u64),(bool,bool),bool);
 // ranges | infinity<bool> | InclusiveRange
 
 /*  stuff I wanted to ask
@@ -313,7 +298,7 @@ impl QueryConditions{
                     
                     
     
-                    let comparison_result = match (row_value, value) {
+                    match (row_value, value) {
                         (AlbaTypes::Int(x), AlbaTypes::Int(y)) => {
                             
                             let result = if lower { if equality { x <= y } else { x < y } } 
@@ -386,9 +371,7 @@ impl QueryConditions{
                             
                             return Err(gerr("Invalid type for numeric comparison"));
                         }
-                    };
-                    
-                    comparison_result
+                    }
                 },
                 Operator::Different => {
                     
@@ -524,115 +507,22 @@ impl QueryConditions{
     }
 
     pub fn query_type(&self) -> Result<QueryType, Error> {
-        // Early return for scan conditions
         if self.chain.is_empty() || self.primary_key.is_none() {
             return Ok(QueryType::Scan);
         }
-        
-        let pk = self.primary_key.as_ref().unwrap();
-        
-        let mut range: LogicCell = ((0, 0), (false, false), false);
-        let l = self.chain.len();
-        let mut logic_cells: Vec<LogicCell> = Vec::new();
-        let mut gates: Vec<bool> = Vec::new();
-        let mut range_mutated = false;
-        
-        let ad = discriminant(&LogicalGate::And);
-        
-        // Process chain into logic cells and gates
-        for i in self.chain.iter() {
-            if i.0.column != *pk {
-                logic_cells.push(((0, 0), (false, false), false));
-            } else {
-                let index = i.0.value.get_id();
-                let cell = i.0.operator.get_range(index as u64);
-                if !range_mutated{
-                    range = cell.clone();
-                    range_mutated = true;
-                }
-                logic_cells.push(cell);
+        let pk = self.primary_key.clone().unwrap();
+        let chain : Vec<(QueryConditionAtom,Option<LogicalGate>)> = self.chain.clone().into_iter().filter(|p|p.0.column == pk).collect();
+        if chain.is_empty(){
+            return Ok(QueryType::Scan)
+        }
+        for i in chain{
+            match i.0.operator{
+                Operator::Equal|Operator::StrictEqual => {
+                    return Ok(QueryType::Indexed(QueryIndexType::Strict(get_index(i.0.value))))
+                },
+                _ => {continue;}
+                
             }
-            
-            if let Some(logic_gate) = i.1 {
-                let is_and = ad == discriminant(&logic_gate);
-                gates.push(is_and);
-            }
-        }
-        for (cell, gate) in logic_cells.iter().zip(gates.iter()) {
-            if range == ((0, 0), (false, false), false) {
-                range = *cell;
-                continue;
-            }
-            
-            if *gate { // AND operation
-                
-                // Handle null flag
-                if range.2 != cell.2 && cell.2 {
-                    range.2 = cell.2;
-                }
-                
-                // Intersect upper bound
-                if range.0.1 == 0 && range.1.1 == true && cell.0.1 != 0 && cell.1.1 == false {
-                    range.0.1 = cell.0.1;
-                    range.1.1 = false;
-                }
-                
-                // Intersect lower bound
-                if range.0.0 == 0 && range.1.0 == true && cell.0.0 != 0 && cell.1.0 == false {
-                    range.0.0 = cell.0.0;
-                    range.1.0 = false;
-                }
-            } else { // OR operation
-                
-                // Handle null flag
-                if range.2 || cell.2 {
-                    range.2 = true;
-                }
-                
-                // Expand lower bound (take minimum)
-                if cell.0.0 != 0 && (range.0.0 == 0 || cell.0.0 < range.0.0) {
-                    range.0.0 = cell.0.0;
-                    range.1.0 = cell.1.0;
-                }
-                
-                // Expand upper bound (take maximum)
-                if cell.0.1 != 0 && (range.0.1 == 0 || cell.0.1 > range.0.1) {
-                    range.0.1 = cell.0.1;
-                    range.1.1 = cell.1.1;
-                }
-            }
-        }
-        
-        // Normalize range bounds
-        if range.0.0 == 0 && range.1.0 {
-            range.0.0 = 0;
-            range.1.0 = false;
-        }
-        if range.0.1 == 0 && range.1.1 {
-            range.0.1 = u64::MAX;
-            range.1.1 = false;
-        }
-        
-        
-        // Determine query type based on final range
-        if range == ((0, 0), (false, false), false) {
-            return Ok(QueryType::Scan);
-        }
-        
-        if range.0.0 > range.0.1 {
-            return Ok(QueryType::Scan);
-        }
-        
-        if range.2 && range.0.0 == range.0.1 {
-            return Ok(QueryType::Indexed(QueryIndexType::Strict(range.0.0)));
-        }
-        
-        if range.2 && range.0.0 != range.0.1 {
-            return Ok(QueryType::Indexed(QueryIndexType::InclusiveRange(range.0.0..=range.0.1)));
-        }
-        
-        if !range.2 && range.0.0 != range.0.1 {
-            return Ok(QueryType::Indexed(QueryIndexType::Range(range.0.0..range.0.1)));
         }
         Ok(QueryType::Scan)
     }

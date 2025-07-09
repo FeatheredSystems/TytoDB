@@ -1,11 +1,10 @@
 
-use std::{collections::{BTreeMap, BTreeSet, HashMap}, io::{Error, ErrorKind}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
-
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, hash::{DefaultHasher, Hasher, Hash}, io::{Error, ErrorKind}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
 use tokio::sync::Mutex;
-use crate::{alba_types::{into_schema, AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr};
+use crate::{alba_types::{into_schema, AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr, indexing:: Hashmap as IndexingHashMap};
 
 
-type MvccType = Arc<Mutex<(BTreeMap<u64,(bool,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
+type MvccType = Arc<Mutex<(BTreeMap<u64,(MvccState,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
 #[derive(Debug)]
 pub struct Container{
     pub file : Arc<Mutex<std::fs::File>>,
@@ -13,10 +12,38 @@ pub struct Container{
     pub headers : Vec<(String,AlbaTypes)>,
     pub mvcc : MvccType,
     pub headers_offset : u64,
-    pub graveyard : Arc<Mutex<BTreeSet<u64>>>
+    pub graveyard : Arc<Mutex<BTreeSet<u64>>>,
+    pub index_map : Arc<Mutex<IndexingHashMap>>
 
 }
+#[derive(Debug,Copy,Clone)]
+pub enum MvccState{
+    Delete,
+    Insert,
+    Edit
+}
 
+pub fn get_index(i : AlbaTypes) -> u64{
+    match i{
+        AlbaTypes::Int(b) => b as u64,
+        AlbaTypes::Bigint(b) => b as u64,
+        AlbaTypes::Float(b) => b as u64,
+        AlbaTypes::Char(b) => b as u64,
+        AlbaTypes::Bool(b) => b as u64,
+        AlbaTypes::NanoBytes(b)|AlbaTypes::SmallBytes(b)|AlbaTypes::MediumBytes(b)|AlbaTypes::BigSBytes(b)|AlbaTypes::LargeBytes(b) => {
+            let mut hasher = DefaultHasher::new();
+            b.hash(&mut hasher);
+            hasher.finish()
+        },
+        AlbaTypes::NanoString(b)|AlbaTypes::SmallString(b)|AlbaTypes::MediumString(b)|AlbaTypes::BigString(b)|AlbaTypes::LargeString(b)|AlbaTypes::Text(b) => {
+            let mut hasher = DefaultHasher::new();
+            b.hash(&mut hasher);
+            hasher.finish()
+        },
+        AlbaTypes::NONE => 0u64
+
+    }
+}
 
 impl Container {
     pub async fn new(path : &str,element_size : usize, columns : Vec<AlbaTypes>,headers_offset : u64,column_names : Vec<String>) -> Result<Arc<Mutex<Self>>,Error> {
@@ -48,12 +75,13 @@ impl Container {
             hash_header.insert(i.0.clone(),i.1.clone());
         }
         let container = Arc::new(Mutex::new(Container{
-            element_size: element_size.clone(),
+            element_size,
             mvcc: Arc::new(Mutex::new((BTreeMap::new(),HashMap::new()))),
-            headers_offset: headers_offset.clone() ,
+            headers_offset,
             headers,
             graveyard: Arc::new(Mutex::new(BTreeSet::new())),
-            file
+            file,
+            index_map: Arc::new(Mutex::new(IndexingHashMap::new(format!("{}.hm",path))?))
         }));
         Ok(container)
     }
@@ -184,8 +212,8 @@ impl Container{
     pub async fn push_row(&mut self, data : Vec<AlbaTypes>) -> Result<(),Error>{
         let ind = self.get_next_addr().await?;
         let mut mvcc_guard = self.mvcc.lock().await;
-        println!("PUSH_ROW - OFFSET : {}",ind);
-        mvcc_guard.0.insert(ind, (false,data));
+        //println!("PUSH_ROW - OFFSET : {}",ind);
+        mvcc_guard.0.insert(ind, (MvccState::Insert,data));
         Ok(())
     }
     pub async fn rollback(&mut self) -> Result<(),Error> {
@@ -200,13 +228,14 @@ impl Container{
         let mut mvcc = self.mvcc.lock().await;
         let mut insertions: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
         let mut deletes: Vec<(u64, Vec<AlbaTypes>)> = Vec::new();
+        let mut edits:Vec<(u64,Vec<AlbaTypes>)> = Vec::new();
         for (index, value) in mvcc.0.iter() {
             
             let v = (*index, value.1.clone());
-            if value.0 {
-                deletes.push(v);
-            } else {
-                insertions.push(v);
+            match value.0{
+                MvccState::Delete => deletes.push(v),
+                MvccState::Insert => insertions.push(v),
+                MvccState::Edit => edits.push(v)
             }
         }
         mvcc.0.clear();
@@ -215,13 +244,26 @@ impl Container{
 
         let mut writting : Vec<(u64,Vec<u8>)> = Vec::new();
         let schema = self.columns();
-        println!("schema {:?}",schema);
+        //println!("schema {:?}",schema);
+        let mut index_batch : Vec<(AlbaTypes,u64)> = Vec::new();
         for (row_index, mut row_data) in insertions {
-            println!("\nrow_data: {:?}\n",row_data);
+            //println!("\nrow_data: {:?}\n",row_data);
             into_schema(&mut row_data, &schema)?;
             let serialized = self.serialize_row(&row_data).unwrap();
+            index_batch.push((row_data[0].clone(),row_index.clone()));
             let offset = row_index;
             writting.push((offset,serialized));
+        }
+        let mut indexing = self.index_map.lock().await;
+        for (row_index, mut row_data) in edits{
+            //println!("\nrow_data: {:?}\n",row_data);
+            into_schema(&mut row_data, &schema)?;
+            let serialized = self.serialize_row(&row_data).unwrap();
+            let key = get_index(row_data[0].clone());
+            indexing.remove(key)?;
+            index_batch.push((row_data[0].clone(),row_index.clone()));
+            let offset = row_index;
+            writting.push((offset,serialized)); 
         }
 
         drop(schema);
@@ -232,6 +274,9 @@ impl Container{
         for del in &deletes {
             let offset = del.0;
             gy.insert(offset);
+            let key = get_index(del.1[0].clone());
+
+            indexing.remove(key)?;
             writting.push((offset,buf.clone()));
         }
         
@@ -253,9 +298,15 @@ impl Container{
         }
         let l_1 = l.len();
         let c= self.file.clone();
-        batch_write_data(l, l_1, c.lock().await.as_raw_fd()).await;
+        let a = batch_write_data(l, l_1, c.lock().await.as_raw_fd());
         
         
+        for (alb,off) in index_batch{
+            let key = get_index(alb);
+            indexing.insert(key,off)?;    
+        };
+        indexing.sync()?;
+        a.await;
         Ok(())
     }
     
@@ -263,12 +314,11 @@ impl Container{
         self.headers.iter().map(|v|v.1.clone()).collect()
     }
     pub fn serialize_row(&self, row: &[AlbaTypes]) -> Result<Vec<u8>, Error> {
-        let mut buffer = Vec::new();    
-        println!("rows: {:?}",row);
+        let mut buffer = Vec::new();
         for i in row{
             i.serialize_into(&mut buffer);
         }
-        println!("data: {:?}",buffer);
+        //println!("data: {:?}",buffer);
         // Validate buffer size matches element_size
         if buffer.len() != self.element_size {
             return Err(Error::new(

@@ -156,14 +156,12 @@ struct AstRollback{
     container : Option<String>,
 }
 
-fn gerr(msg : &str) -> Error{
-    return Error::new(ErrorKind::Other, msg.to_string())
-}
+fn gerr(msg : &str) -> Error{Error::new(ErrorKind::Other, msg.to_string())}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = match connect().await{
-        Ok(database) => database,
+        Ok(database) => {println!("connected");database},
         Err(e) => panic!("{}",e.to_string())
     };
     if let Err(e) = db.run_database().await{

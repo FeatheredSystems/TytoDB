@@ -166,11 +166,7 @@ fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values:
     };
     
     *index += instance_size;
-    let trimmed: Vec<u8> = string_bytes.iter()
-        .take_while(|&&b| b != 0)
-        .cloned()
-        .collect();
-    let s = String::from_utf8_lossy(&trimmed).to_string();
+    let s = String::from_utf8_lossy(string_bytes).to_string();
     
     match instance_size {
         18 => values.push(AlbaTypes::NanoString(s)),

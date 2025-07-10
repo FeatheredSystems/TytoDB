@@ -35,20 +35,20 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
     let column_names = &lck.column_names();
     let qt = args.conditions.query_type()?;
     if let QueryType::Indexed(QueryIndexType::Strict(u)) = qt{
+        let mut res = (Vec::new(),Vec::new());
 
-        if let Some(offset) = lck.index_map.lock().await.get(u)?{
-            let mut buff = vec![0u8;args.element_size];
-            file.read_exact_at(&mut buff, offset)?;
-            let b = Row{data:lck.deserialize_row(&buff).await?};
-            if args.conditions.row_match(&b, column_names)?{
-                return Ok((vec![b],vec![u]))
-            }else{
-                return Ok((Vec::new(),Vec::new()))
+        for u in u{
+            if let Some(offset) = lck.index_map.lock().await.get(u)?{
+                let mut buff = vec![0u8;args.element_size];
+                file.read_exact_at(&mut buff, offset)?;
+                let b = Row{data:lck.deserialize_row(&buff).await?};
+                if args.conditions.row_match(&b, column_names)?{
+                    res.0.push(b);res.1.push(u);
+                }
             }
-        }else{
-
-            return Ok((Vec::new(),Vec::new()))
         }
+
+        return Ok(res)
     }
 
     let total_rows = (file.metadata()?.len() as usize - args.header_offset)/args.element_size;

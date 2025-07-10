@@ -34,7 +34,7 @@ pub struct QueryConditions{
 
 #[derive(Debug)]
 pub enum QueryIndexType {
-    Strict(u64),
+    Strict(Vec<u64>),
     // Range(Range<u64>),
     // InclusiveRange(RangeInclusive<u64>), 
 }
@@ -61,9 +61,6 @@ enum Operator{
 
 // ranges | infinity<bool> | InclusiveRange
 
-/*  stuff I wanted to ask
-- can cpu be processed in gpu even while with horrible performance?
-*/
 impl QueryConditions{
     pub fn from_primitive_conditions(primitive_conditions : PrimitiveQueryConditions, column_properties : &HashMap<String,AlbaTypes>,primary_key : String) -> Result<Self,Error>{
         let mut chain : Vec<(QueryConditionAtom,Option<LogicalGate>)> = Vec::new();
@@ -500,16 +497,22 @@ impl QueryConditions{
         if chain.is_empty(){
             return Ok(QueryType::Scan)
         }
+        let mut index_array = Vec::new();
         for i in chain{
             match i.0.operator{
                 Operator::Equal|Operator::StrictEqual => {
-                    return Ok(QueryType::Indexed(QueryIndexType::Strict(get_index(i.0.value))))
+                    index_array.push(get_index(i.0.value))
                 },
                 _ => {continue;}
                 
             }
         }
-        Ok(QueryType::Scan)
+        if index_array.len() > 0{
+            Ok(QueryType::Indexed(QueryIndexType::Strict(index_array)))    
+        }else{
+            Ok(QueryType::Scan)
+        }
+
     }
 
 }

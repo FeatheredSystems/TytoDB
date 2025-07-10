@@ -850,6 +850,29 @@ impl Database{
                                 }
                             }
                         },
+                        commands::BatchCreateRows(create_row) => {
+                            let mut bururu = None;
+                            for col_val in create_row.col_val{
+                                match mtx_db.lock().await.run(AST::CreateRow(AstCreateRow{
+                                    col_nam: create_row.col_nam.clone(),
+                                    col_val: col_val.iter().map(|f|{ab_from_nat(f.clone())}).collect(),
+                                    container: create_row.container.clone()
+                                })).await{
+                                    Ok(a) => bururu = Some(a),
+                                    Err(e) => {
+                                        let mut b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                        b.extend_from_slice(&e.to_string().as_bytes());
+                                        return b
+                                    }
+                                }
+                            }
+                            if let Some(prrrprrrcatapim) = bururu{
+                                prrrprrrcatapim
+                            }else{
+                                let b = vec![1u8,73, 110, 118, 97, 108, 105, 100, 32, 104, 101, 97, 100, 101, 114, 115, 32];
+                                return b
+                            }
+                        },
                         commands::EditRow(edit_row) => {
                             match mtx_db.lock().await.run(AST::EditRow(AstEditRow{
                                 col_nam: edit_row.col_nam,

@@ -939,7 +939,7 @@ impl Database{
             }));
             val
         })});
-        println!("connection");
+
         Server::new(host, password, message_handler, workers).await
     }
 }

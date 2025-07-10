@@ -55,14 +55,14 @@ pub fn into_schema(target: &mut Vec<AlbaTypes>, schema: &Vec<AlbaTypes>) -> Resu
 
     for (t, s) in target.iter_mut().zip(schema.iter()) {
         if std::mem::discriminant(t) != std::mem::discriminant(s) {
-            println!("Converting {:?} to {:?}", t, s);
+
             match convert_to_schema_type(t.clone(), s) {
                 Ok(new_value) => {
-                    println!("Successfully converted to: {:?}", new_value);
+
                     *t = new_value;
                 }
                 Err(e) => {
-                    println!("Conversion failed: {}", e);
+
                     return Err(e);
                 }
             }

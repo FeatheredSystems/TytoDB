@@ -32,13 +32,13 @@ impl MvccRecord{
         Ok(buffer)
     }
     async fn clear(&mut self) -> Result<(),Error> {
-        self.0.lock().await.set_len(0)?; Ok(())
+        self.0.lock().await.set_len(0)?; self.sync().await?;Ok(())
     }
     async fn sync(&mut self) -> Result<(),Error>{
         let reference = self.0.clone();
         tokio::task::spawn_blocking(async move ||{    
             let n = reference.lock().await;
-            n.sync_data();
+            let _ = n.sync_data();
         });
         Ok(())
     }
@@ -109,7 +109,7 @@ impl Container {
             }
             headers.push((name.to_owned(), value.to_owned()));
         }
-        let file = Arc::new(Mutex::new(std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap()));
+        let file = Arc::new(Mutex::new(std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap()));
         let mut hash_header = HashMap::new();
         for i in headers.iter(){
             hash_header.insert(i.0.clone(),i.1.clone());
@@ -223,19 +223,6 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
 }
 
 impl Container{
-    pub async fn len(&self) -> Result<u64,Error>{
-        Ok(self.file.lock().await.metadata()?.len())
-    }
-    // pub fn get_alba_type_from_column_name(&self,column_name : &String) -> Option<AlbaTypes>{
-    //     for i in self.headers.iter(){
-    //         if *i.0 == *column_name{
-    //             let v = i.1.clone();
-    //             return Some(v)
-    //         }
-    //     }
-    //     None
-    // }
-
     pub async fn get_next_addr(&self) -> Result<u64, Error> {
         let mv = self.mvcc.lock().await;
         let mut gy = self.graveyard.lock().await;
@@ -271,7 +258,7 @@ impl Container{
         b.extend_from_slice(&self.serialize_row(&data)?);
         b.extend_from_slice(&key.to_le_bytes());
         let mut l = self.mvcc_record.lock().await;
-        l.put(b).await;
+        l.put(b).await?;
         Ok(())
     }
     pub async fn push_row(&mut self, data : Vec<AlbaTypes>) -> Result<(),Error>{
@@ -281,7 +268,7 @@ impl Container{
         let d = data.clone();
         mvcc_guard.0.insert(ind, (MvccState::Insert,data));
         drop(mvcc_guard);
-        self.record_mvcc(ind, d, MvccState::Insert).await;
+        let _ = self.record_mvcc(ind, d, MvccState::Insert).await;
         Ok(())
     }
     pub async fn rollback(&mut self) -> Result<(),Error> {
@@ -289,7 +276,7 @@ impl Container{
         mvcc_guard.0.clear();
         mvcc_guard.1.clear();
         let mut mvcc_rec = self.mvcc_record.lock().await;
-        mvcc_rec.clear().await;
+        let _ = mvcc_rec.clear().await;
         drop(mvcc_guard);
         Ok(())
     }
@@ -349,10 +336,7 @@ impl Container{
             indexing.remove(key)?;
             writting.push((offset,buf.clone()));
         }
-        let mut mvcc_record = self.mvcc_record.lock().await;
-        mvcc_record.clear().await?;
-        mvcc.1.clear();
-        mvcc.1.shrink_to_fit();
+       
         // if let Some(s) = STRIX.get(){
         //     let mut l = s.lock().await;
         //     l.wards.push(Mutex::new((std::fs::OpenOptions::new().read(true).write(true).open(&self.file_path)?,virtual_ward)));
@@ -371,20 +355,22 @@ impl Container{
         let f = self.file.lock().await;
         let c = f.as_raw_fd();
 
-        
+        for (alb,off) in index_batch{
+            let key = get_index(alb);
+            indexing.insert(key,off)?;    
+        };
+        indexing.sync()?; 
 
         for l in l.chunks(3000){
             let l_1 = l.len();
             batch_write_data(l.to_vec(), l_1, c).await;
         }
 
-        for (alb,off) in index_batch{
-            let key = get_index(alb);
-            indexing.insert(key,off)?;    
-        };
-        indexing.sync()?;
         
         
+        let mut mvcc_record = self.mvcc_record.lock().await;
+        mvcc_record.clear().await?;
+        mvcc.1.clear(); mvcc.0.clear(); 
         Ok(())
     }
     

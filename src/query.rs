@@ -35,7 +35,7 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
     let column_names = &lck.column_names();
     let qt = args.conditions.query_type()?;
     if let QueryType::Indexed(QueryIndexType::Strict(u)) = qt{
-        println!("--> u={}",u);
+
         if let Some(offset) = lck.index_map.lock().await.get(u)?{
             let mut buff = vec![0u8;args.element_size];
             file.read_exact_at(&mut buff, offset)?;
@@ -46,7 +46,7 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
                 return Ok((Vec::new(),Vec::new()))
             }
         }else{
-            println!("not found :(");
+
             return Ok((Vec::new(),Vec::new()))
         }
     }

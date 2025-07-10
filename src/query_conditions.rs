@@ -262,7 +262,7 @@ impl QueryConditions{
         for (i,(query_condition, logical_gate)) in self.chain.iter().enumerate() {
             let column = &query_condition.column;
             let value = &query_condition.value;
-            println!("{:?}\t{:?}\t{:?}",query_condition,logical_gate,row);
+            //println!("{:?}\t{:?}\t{:?}",query_condition,logical_gate,row);
             let ci = {
                 let mut c = 0usize;
                 for i in row.data.iter().zip(row_headers.iter()).enumerate(){
@@ -361,11 +361,8 @@ impl QueryConditions{
                         },
                         (AlbaTypes::Float(x), AlbaTypes::Bigint(y)) => {
                             let y_promoted = *y as f64;
-                            
-                            let result = if lower { if equality { *x <= y_promoted } else { *x < y_promoted } } 
-                            else { if equality { *x >= y_promoted } else { *x > y_promoted } };
-                            
-                            result
+                            if lower { if equality { *x <= y_promoted } else { *x < y_promoted } } 
+                            else { if equality { *x >= y_promoted } else { *x > y_promoted } }
                         },
                         _ => {
                             
@@ -374,11 +371,7 @@ impl QueryConditions{
                     }
                 },
                 Operator::Different => {
-                    
-                    
-                    let result = *value != *row_value;
-                    
-                    result
+                    *value != *row_value
                 },
                 Operator::StringContains | Operator::StringCaseInsensitiveContains => {
                     let case_insensitive = discriminant(&query_condition.operator) == 
@@ -410,16 +403,11 @@ impl QueryConditions{
                         }
                     };
     
-                    let result = if case_insensitive {
-                        
+                    if case_insensitive {
                         row_string.to_lowercase().contains(&value_string.to_lowercase())
-                    } else {
-                        
+                    } else {   
                         row_string.contains(&value_string)
-                    };
-                    
-                    
-                    result
+                    }
                 },
                 Operator::StringRegularExpression => {
                     
@@ -451,10 +439,7 @@ impl QueryConditions{
                     
     
                     let regex_result = if let Some(cached_regex) = regex_cache.get(&value_string) {
-                        
-                        let match_result = cached_regex.is_match(&row_string);
-                        
-                        match_result
+                        cached_regex.is_match(&row_string)
                     } else {
                         
                         let re = Regex::new(&value_string);
@@ -477,7 +462,7 @@ impl QueryConditions{
             };
             
             
-            println!("check:{}",check);
+            //println!("check:{}",check);
             if let Some(gate) = logical_gate {
                 if i == len-1 {return Ok(check)}
                 match gate {

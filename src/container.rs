@@ -1,9 +1,9 @@
 
-use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{self, File, OpenOptions}, hash::{DefaultHasher, Hash, Hasher}, io::{Error, ErrorKind, Read, Write}, os::{fd::AsRawFd, unix::fs::MetadataExt}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{self, File, OpenOptions}, hash::{DefaultHasher, Hash, Hasher}, io::{Error, ErrorKind, Read, Write}, os::{fd::AsRawFd, unix::fs::{FileExt, MetadataExt}}, sync::Arc};
 use tokio::sync::Mutex;
-
 use crate::{alba_types::{into_schema,AlbaTypes}, database::{batch_write_data, WriteEntry}, gerr, indexing:: Hashmap as IndexingHashMap};
-
+use bitvec::prelude::*;
+pub const MAX_GRAVEYARD_LENGTH_IN_MEMORY : usize = 1250;
 
 type MvccType = Arc<Mutex<(BTreeMap<u64,(MvccState,Vec<AlbaTypes>)>,HashMap<String,(bool,String)>)>>;
 
@@ -137,33 +137,16 @@ impl Container{
 
 fn handle_fixed_string(buf: &[u8],index: &mut usize,instance_size: usize,values: &mut Vec<AlbaTypes>) -> Result<(), Error> {
     let bytes = &buf[*index..*index+instance_size];
-    let mut size : [u8;8] = [0u8;8];
-    size.clone_from_slice(&bytes[..8]); 
-    if bytes.len() <= 8 {
-        return Err(gerr("Not insuficient string size"));
+    let mut size_bytes : [u8;8] = [0u8;8];
+    size_bytes.clone_from_slice(&bytes[..8]); 
+
+    let string_length = u64::from_be_bytes(size_bytes) as usize;
+
+    if 8 + string_length > instance_size {
+        return Err(gerr(&format!("Invalid string length in data, expected at most {} but got {}", instance_size - 8, string_length)));
     }
-    let string_length = u64::from_le_bytes(size);
-    let string_bytes = if string_length > 0 {
-        let l = bytes.len();
-        if (string_length+8) >= l as u64 {
-            &bytes[8..]
-        }else{
-           &bytes[8..(8+string_length as usize)] 
-        }
-        
-    }else{
-        
-        let s = String::new();
-        match instance_size {
-            18 => values.push(AlbaTypes::NanoString(s)),
-            108 => values.push(AlbaTypes::SmallString(s)),
-            508 => values.push(AlbaTypes::MediumString(s)),
-            2_008 => values.push(AlbaTypes::BigString(s)),
-            3_008 => values.push(AlbaTypes::LargeString(s)),
-            _ => unreachable!(),
-        }
-        return Ok(())
-    };
+
+    let string_bytes = &bytes[8..(8 + string_length)];
     
     *index += instance_size;
     let s = String::from_utf8_lossy(string_bytes).to_string();
@@ -217,7 +200,8 @@ fn handle_bytes(buf: &[u8],index: &mut usize,size: usize,values: &mut Vec<AlbaTy
     }
     Ok(())
 }
-
+const VACCUM_SIZE : u64 = 4194304;
+const MAX_VACUUM_LENGTH : usize = 625000;
 impl Container{
     pub async fn get_next_addr(&self) -> Result<u64, Error> {
         let mv = self.mvcc.lock().await;
@@ -231,6 +215,96 @@ impl Container{
             return Ok(*m+self.element_size as u64)
         }
         Ok(size)
+    }
+    pub async fn vacuum(&mut self) -> Result<(),Error> {
+        self.graveyard.lock().await.clear();
+        let mut mvcc = self.mvcc.lock().await;
+        mvcc.0.clear(); mvcc.1.clear();
+
+        let fi = self.file.lock().await;
+        let element_size = self.element_size as u64;
+        let length = (fi.metadata()?.size()-self.headers_offset)/element_size;
+
+        if length == 0{
+            return Ok(());
+        }
+
+        let mut map = bitvec!();
+        let mut readen = 0u64;
+        let chunk_size : u64 = VACCUM_SIZE/self.element_size as u64;
+        let empty = vec![255u8;self.element_size];
+        let mut pairs : Vec<(u64,u64)> = Vec::new();
+        
+        for _ in 0..(length/chunk_size).max(1){
+            let etr = (length - readen).min(chunk_size) as u64; //elements to read
+            let offset : u64 = self.headers_offset + (readen * element_size);
+            readen += etr;
+            let mut buffer = vec![0u8;(element_size*etr) as usize];
+            fi.read_exact_at(&mut buffer, offset)?;
+            for j in buffer.chunks_exact(self.element_size){
+                map.push(j != empty)
+            }
+            drop(buffer); 
+        }
+        map.shrink_to_fit();
+        let mut cursor : usize = 0;
+        let mut back_c : usize = map.len()-1;
+        let len = map.len();
+        let mut run = false; // false ~ forward | true ~ backwards
+        
+        while cursor < back_c{
+            if run == false{
+                if let Some(val) = map.get(cursor){
+                    if !*val{
+                        run = true;
+                    }else{
+                        cursor += 1;
+                    }
+                }
+            }else if run == true{
+                if let Some(val) = map.get(back_c){
+                    if *val{
+                        pairs.push((cursor as u64, back_c as u64));
+                        if pairs.len() > MAX_VACUUM_LENGTH{
+                            break;
+                        }
+                        run = false;
+                    }else{
+                        back_c = back_c.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        let mut indexing = self.index_map.lock().await;
+        for (dead, alive) in pairs{
+            let mut buffer = vec![0u8;self.element_size];
+            let alive_offset = (alive*element_size) + self.headers_offset;
+            fi.read_exact_at(&mut buffer,alive_offset)?;
+            let row_pk = self.deserialize_row(&buffer).await?[0].clone();
+            let dead_offset = (dead*element_size)+ self.headers_offset;
+            fi.write_all_at(&buffer, dead_offset)?;
+            fi.write_all_at(&vec![255u8;self.element_size], alive_offset)?;
+            indexing.insert(get_index(row_pk),dead_offset)?;
+            fi.sync_all()?;
+            indexing.sync()?;
+            map.swap(dead as usize, alive as usize);
+        }
+            
+        let mut rows_to_remove = 0u64;
+        let mut index = map.len()-1;
+        while let Some(val) = map.get(index){
+                if *val{break;}else{rows_to_remove+=1;if index==0{break;};index-=1;}
+        }
+
+        if rows_to_remove > 0{
+            let new_len = fi.metadata()?.size().saturating_sub(rows_to_remove*element_size).max(self.headers_offset);
+            fi.set_len(new_len)?;
+            fi.sync_all()?;
+        }
+
+
+        
+        Ok(())
     }
     pub async fn load_mvcc(&mut self) -> Result<(),Error>{
         let mut mvcc_record = self.mvcc_record.lock().await;
@@ -258,6 +332,12 @@ impl Container{
         Ok(())
     }
     pub async fn push_row(&mut self, data : Vec<AlbaTypes>) -> Result<(),Error>{
+        let mut indexing = self.index_map.lock().await;
+        let i = get_index(data[0].clone());
+        if indexing.get(i)?.is_some(){
+            return Err(Error::new(ErrorKind::AddrInUse,"This primary key is in use, they must be always unique."))
+        }
+        drop(indexing);
         let ind = self.get_next_addr().await?;
         let mut mvcc_guard = self.mvcc.lock().await;
         //println!("PUSH_ROW - OFFSET : {}",ind);
@@ -322,11 +402,15 @@ impl Container{
         drop(schema);
 
 
-        let buf = vec![0u8; self.element_size];
+        let buf = vec![255u8; self.element_size];
         let mut gy = self.graveyard.lock().await;
+        let mut gyl = gy.len();
         for del in &deletes {
             let offset = del.0;
-            gy.insert(offset);
+            if gyl < MAX_GRAVEYARD_LENGTH_IN_MEMORY{
+                gy.insert(offset);
+                gyl += 1;
+            }
             let key = get_index(del.1[0].clone());
 
             indexing.remove(key)?;

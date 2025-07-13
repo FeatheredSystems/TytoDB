@@ -22,3 +22,5 @@ falcotcp = {path = "/home/theo/Documents/coding/FalcoTCP/", features=["tokio-run
 tokio = {version="1.45.1",features=["full"]}
 blake3 = "1.8.2"
 rand = "0.9.1"
+bitvec = "1.0.1"
+chrono = "0.4.41"

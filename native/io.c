@@ -63,6 +63,7 @@ int batch_write_data_c(WriteEntry* entries, size_t len, const int file) {
     return 0;
 }
 
+/*
 
 struct ReadInstance{
     uint64_t size;
@@ -74,7 +75,7 @@ struct ReadEntry{
     uint64_t len;
     struct ReadInstance* buffer_array;
 };
-
+*/
 /* Error codes for batch_reads
  *
  * -1 : failed to get SQE
@@ -82,7 +83,7 @@ struct ReadEntry{
  * -3 : failed to submit io_uring_submit
  *  -4 : failed
  * */
-
+/*
 int batch_reads(struct ReadEntry* re, int file){
     struct io_uring ring;
 
@@ -122,11 +123,4 @@ int batch_reads(struct ReadEntry* re, int file){
 
 
 
-
-
-
-
-
-
-
-
+*/

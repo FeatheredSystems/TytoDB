@@ -28,12 +28,20 @@ pub enum AlbaTypes{
 
 fn serialize_closed_string(item_size : usize,s : &String,buffer : &mut Vec<u8>){
     let mut bytes = Vec::with_capacity(item_size);
-    let mut str_bytes = s.as_bytes().to_vec();
-    let str_length = str_bytes.len().to_le_bytes().to_vec();
-    str_bytes.truncate(item_size-size_of::<u64>());
-    bytes.extend_from_slice(&str_length);
-    bytes.extend_from_slice(&str_bytes);
-    bytes.resize(item_size,0);
+    let size = s.len().to_be_bytes();
+    let mut str = s.to_owned();
+    let _ = s;
+    
+    if str.len() > item_size - 8{
+        str.truncate(item_size-8);
+    }
+    let str_bytes = str.as_bytes();
+    bytes.extend_from_slice(&size);
+    bytes.extend_from_slice(str_bytes);
+    
+    if bytes.len() < item_size{
+        bytes.resize(item_size, 0);
+    }
     buffer.extend_from_slice(&bytes);
 }
 fn serialize_closed_blob(item_size : usize,mut blob : Vec<u8>,buffer : &mut Vec<u8>){
@@ -448,7 +456,7 @@ fn truncate_or_pad_string(s: String, max_len: usize) -> String {
     if s.len() > max_len {
         s[..max_len].to_string()
     } else {
-        format!("{: <width$}", s, width = max_len)
+        s
     }
 }
 

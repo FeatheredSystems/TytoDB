@@ -1,11 +1,11 @@
-use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::HashMap, fs::{self, File}, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use crate::{alba_types::AlbaTypes, container::{Container,MvccState}, gerr, logerr, query::{search, Query, SearchArguments}, query_conditions::QueryConditions, row::Row, AstCommit, AstCreateRow, AstDeleteContainer, AstDeleteRow, AstEditRow, AstRollback, AstSearch, Token, AST};
 use rand::{rngs::OsRng, Rng, TryRngCore};
 use tokio::sync::Mutex;
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 
 
 
@@ -91,7 +91,6 @@ pub enum Schedule {
 pub enum ScheduleError {
     InvalidFormat,
     InvalidNumber,
-    InvalidTime,
     InvalidDate,
     InvalidRange,
 }

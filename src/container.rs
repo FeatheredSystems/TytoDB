@@ -109,7 +109,7 @@ impl Container {
             }
             headers.push((name.to_owned(), value.to_owned()));
         }
-        let regen_hm = (!fs::exists(format!("{}.hashmap",path))? && fs::exists(path.to_string())?);
+        let regen_hm = !fs::exists(format!("{}.hashmap",path))? && fs::exists(path.to_string())?;
         let file =std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
         let mut hash_header = HashMap::new();
         for i in headers.iter(){

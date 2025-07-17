@@ -38,7 +38,7 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
     let mut gy = lck.graveyard.lock().await;
     if let QueryType::Indexed(QueryIndexType::Strict(u)) = qt{
         let mut res = (Vec::new(),Vec::new());
-
+        println!("u:{:?}",u);
         for u in u{
             if let Some(offset) = lck.index_map.lock().await.get(u)?{
                 if gy.contains(&offset) {continue;}
@@ -46,6 +46,7 @@ pub async fn search(container: Arc<Mutex<Container>>, args: SearchArguments) -> 
                 file.read_exact_at(&mut buff, offset)?;
                 if buff == empty{continue;}
                 let b = Row{data:lck.deserialize_row(&buff).await?};
+                println!("b: {:?}",b);
                 if args.conditions.row_match(&b, column_names)?{
                     res.0.push(b);res.1.push(u);
                 }

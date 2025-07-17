@@ -109,7 +109,8 @@ impl Container {
             }
             headers.push((name.to_owned(), value.to_owned()));
         }
-        let file = Arc::new(Mutex::new(std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap()));
+        let regen_hm = (!fs::exists(format!("{}.hashmap",path))? && fs::exists(path.to_string())?);
+        let file =std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
         let mut hash_header = HashMap::new();
         for i in headers.iter(){
             hash_header.insert(i.0.clone(),i.1.clone());
@@ -120,16 +121,49 @@ impl Container {
             headers_offset,
             headers,
             graveyard: Arc::new(Mutex::new(BTreeSet::new())),
-            file,
             mvcc_record: Arc::new(Mutex::new(MvccRecord::new(format!("{}.mr",path))?)),
-            index_map: Arc::new(Mutex::new(IndexingHashMap::new(format!("{}.hm",path))?))
+            index_map: Arc::new(Mutex::new(IndexingHashMap::new(path.to_string())?)),
+            file: Arc::new(Mutex::new(file))
         }));
-        container.lock().await.load_mvcc().await?;
+        let mut c = container.lock().await;
+        c.load_mvcc().await?;
+        if regen_hm{c.build_hm().await?};
+        drop(c);
         Ok(container)
     }
     
 }
 impl Container{
+    pub async fn build_hm(&mut self) -> Result<(),Error>{
+        let file = self.file.lock().await;
+        let element_size = self.element_size;
+        let headers_offset = self.headers_offset;
+        let mut b = self.index_map.lock().await;
+        let empty = vec![255u8;element_size];
+                    
+                        let total_rows = (file.metadata()?.len() as usize - headers_offset as usize)/element_size;
+                        let rows_per_it = ((4096*5) / element_size).max(1);
+                        let chunk_size = (rows_per_it * element_size).min(total_rows*element_size);
+                        let count_its = (total_rows / rows_per_it).max(1);
+ 
+                        for i in 0..count_its{ 
+                            let mut buffer = vec![0u8;chunk_size];
+                            let file_offset = headers_offset + (i * chunk_size) as u64;
+                            file.read_exact_at(&mut buffer, file_offset).unwrap();
+
+                            for (j,row_bin) in buffer.chunks_exact(element_size).enumerate(){
+            
+                                let offset_in_file = headers_offset as usize+i*chunk_size+j*element_size;
+                                if row_bin == empty{
+                                    continue;
+                                }
+                            let bare_row = self.deserialize_row(row_bin).await?;
+                            b.insert(get_index(bare_row[0].clone()), offset_in_file as u64)?;                          
+                            
+                            }
+                        }           
+        Ok(())
+    }
     pub fn column_names(&self) -> Vec<String>{
         self.headers.iter().map(|v|v.0.to_string()).collect()
     }
@@ -249,7 +283,6 @@ impl Container{
         map.shrink_to_fit();
         let mut cursor : usize = 0;
         let mut back_c : usize = map.len()-1;
-        let len = map.len();
         let mut run = false; // false ~ forward | true ~ backwards
         
         while cursor < back_c{

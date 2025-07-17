@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::{self, File}, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fs::{self, File}, io::{Error, ErrorKind, Read, Write}, os::{raw::c_int, unix::fs::FileExt}, path::PathBuf, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml;
@@ -598,8 +598,28 @@ impl Database{
                         conditions: QueryConditions::from_primitive_conditions(structure.conditions,&col_prop,pk)?
                     }
                 };
-                let rows = search(container.clone(), sa).await?.0;
-                return Ok(Query { rows: (container.lock().await.column_names(),rows) })
+                let mut rows = search(container.clone(), sa).await?.0;
+                let cn = {container.lock().await.column_names().clone()};
+                if structure.col_nam.len() != cn.len(){
+                let mut index_map = HashMap::with_capacity(cn.len());
+                let mut ide = Vec::with_capacity(cn.len());
+                for i in cn.into_iter().enumerate(){index_map.insert(i.1,i.0);}
+                    for i in structure.col_nam.iter(){
+                        if let Some(a) = index_map.get(i){
+                                ide.push(*a);
+                        }
+                    }
+                    rows = rows.into_iter().map(|f|{
+                        let mut val = Vec::with_capacity(ide.len());
+                        for i in ide.iter(){
+                            val.push(f.data[*i].to_owned());
+                        }
+                        Row{data:val}
+                    }).collect();
+                }
+                let q = Query { rows: (structure.col_nam.clone(),rows ) };
+                
+                return Ok(q)
             },
             AST::EditRow(structure) => {
                 let container = if let Some(a) = self.container.get(&structure.container){
@@ -705,6 +725,9 @@ impl Database{
                     let _ = tokio::fs::remove_file(path.clone()).await;
                     let path = format!("{}/{}.hashmap", self.location, structure.container);
                     let _ = tokio::fs::remove_file(path).await;
+                    let path = format!("{}/{}.mr", self.location, structure.container);
+                    let _ = tokio::fs::remove_file(path).await;
+
                     
                     self.save_containers()?;
                     
@@ -1155,11 +1178,10 @@ impl Database{
             };
             let mut once = Vec::new();
             let vacuum_settings : Vec<(String,String)> = vacuum_settings.into_iter().filter(|f| { if f.1.to_lowercase().contains("once"){once.push(f.clone());false}else{true} }).collect();
-            if once.len() > 0{
+            if !once.is_empty(){
                 let db = db.lock().await;
                 for i in once{
                     if let Some(b) = db.container.get(&i.1){
-                        println!("once - vacuum");
                         let _ = b.lock().await.vacuum().await;
                     }
                 }

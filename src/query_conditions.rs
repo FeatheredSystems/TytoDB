@@ -507,7 +507,7 @@ impl QueryConditions{
                 
             }
         }
-        if index_array.len() > 0{
+        if !index_array.is_empty(){
             Ok(QueryType::Indexed(QueryIndexType::Strict(index_array)))    
         }else{
             Ok(QueryType::Scan)
